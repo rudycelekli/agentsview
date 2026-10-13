@@ -395,7 +395,8 @@ func (b localArchiveQueryBackend) SessionUsage(
 			u.Agent = string(def.Type)
 		}
 	}
-	return newStoreSessionUsageOutput(u), usageExitCode(u), nil
+	out := newStoreSessionUsageOutput(u)
+	return out, usageExitCode(out), nil
 }
 
 func closeArchiveQueryBackend(cleanup func()) {
