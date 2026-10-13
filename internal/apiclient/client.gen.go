@@ -22911,6 +22911,8 @@ func (d DBCacheHitRatioDistribution) Validate() error {
 	return errors
 }
 
+type DBCaptureCoverageView = db.CaptureCoverageView
+
 type DBCodeAttribution struct {
 	Sources []DBCodeAttributionSource `json:"sources,omitempty"`
 }
@@ -23248,6 +23250,8 @@ func (d DBPeakContextDistribution) Validate() error {
 	return errors
 }
 
+type DBPlanUsageView = db.PlanUsageView
+
 type DBProjectBreakdown struct {
 	CacheCreationTokens int64      `json:"cacheCreationTokens"`
 	CacheReadTokens     int64      `json:"cacheReadTokens"`
@@ -23458,6 +23462,20 @@ type DBSession = db.Session
 type DBSessionExternalParent = db.SessionExternalParent
 
 type DBSessionLabels = db.SessionLabels
+
+type DBSessionPlanUsageGroup struct {
+	Credits           *string  `json:"credits,omitempty" validate:"required"`
+	FiveHourPercent   *float64 `json:"five_hour_percent,omitempty"`
+	Model             string   `json:"model" validate:"required"`
+	ProductExperience string   `json:"product_experience" validate:"required"`
+	ReasoningEffort   string   `json:"reasoning_effort" validate:"required"`
+	Speed             string   `json:"speed" validate:"required"`
+	WeeklyPercent     *float64 `json:"weekly_percent,omitempty"`
+}
+
+func (d DBSessionPlanUsageGroup) Validate() error {
+	return runtime.ConvertValidatorError(typesValidator.Struct(d))
+}
 
 type DBSessionStats = db.SessionStats
 
@@ -25067,6 +25085,7 @@ type SessionUsageResponse struct {
 	AiCredits           *float64                        `json:"ai_credits,omitempty"`
 	Breakdown           []SessionUsageBreakdownResponse `json:"breakdown" validate:"required"`
 	BreakdownCount      int64                           `json:"breakdown_count"`
+	CaptureCoverage     *DBCaptureCoverageView          `json:"capture_coverage,omitempty"`
 	Cost                MoneyMoney                      `json:"cost"`
 	CostSource          *string                         `json:"cost_source,omitempty"`
 	CostUsd             *float64                        `json:"cost_usd,omitempty"`
@@ -25075,6 +25094,7 @@ type SessionUsageResponse struct {
 	HasTokenData        bool                            `json:"has_token_data"`
 	Models              []string                        `json:"models" validate:"required"`
 	PeakContextTokens   int64                           `json:"peak_context_tokens"`
+	PlanUsage           *DBPlanUsageView                `json:"plan_usage,omitempty"`
 	Project             string                          `json:"project" validate:"required"`
 	RollupCost          *MoneyMoney                     `json:"rollup_cost,omitempty"`
 	RollupCostSource    *string                         `json:"rollup_cost_source,omitempty"`
@@ -25098,6 +25118,13 @@ func (s SessionUsageResponse) Validate() error {
 			}
 		}
 	}
+	if s.CaptureCoverage != nil {
+		if v, ok := any(s.CaptureCoverage).(runtime.Validator); ok {
+			if err := v.Validate(); err != nil {
+				errors = errors.Append("CaptureCoverage", err)
+			}
+		}
+	}
 	if v, ok := any(s.Cost).(runtime.Validator); ok {
 		if err := v.Validate(); err != nil {
 			errors = errors.Append("Cost", err)
@@ -25105,6 +25132,13 @@ func (s SessionUsageResponse) Validate() error {
 	}
 	if err := typesValidator.Var(s.Models, "required"); err != nil {
 		errors = errors.Append("Models", err)
+	}
+	if s.PlanUsage != nil {
+		if v, ok := any(s.PlanUsage).(runtime.Validator); ok {
+			if err := v.Validate(); err != nil {
+				errors = errors.Append("PlanUsage", err)
+			}
+		}
 	}
 	if err := typesValidator.Var(s.Project, "required"); err != nil {
 		errors = errors.Append("Project", err)

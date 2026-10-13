@@ -202,6 +202,20 @@ func usageExitCode(u *db.SessionUsage) int {
 type sessionUsageOutput struct {
 	db.SessionUsage
 	ServerRunning bool `json:"server_running"`
+	// Plan and Coverage are the session's codex-cloud plan usage and live
+	// capture coverage, with the same names as the HTTP response.
+	Plan     *db.PlanUsageView       `json:"plan_usage,omitempty"`
+	Coverage *db.CaptureCoverageView `json:"capture_coverage,omitempty"`
+}
+
+// newStoreSessionUsageOutput wraps a usage result read straight from a
+// store, exposing its plan usage row the way the HTTP response does.
+func newStoreSessionUsageOutput(u *db.SessionUsage) *sessionUsageOutput {
+	return &sessionUsageOutput{
+		SessionUsage: *u,
+		Plan:         u.PlanUsage.PlanUsageView(),
+		Coverage:     u.PlanUsage.CaptureCoverageView(),
+	}
 }
 
 // startupWaitTimeout is how long CLI subcommands wait for a

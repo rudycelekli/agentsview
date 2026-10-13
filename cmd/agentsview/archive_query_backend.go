@@ -38,7 +38,7 @@ type archiveQueryPolicy struct {
 
 type archiveQueryBackend interface {
 	ActivityReport(context.Context, ActivityReportConfig) (activity.Report, error)
-	DailyUsage(context.Context, dailyUsageQuery) (db.DailyUsageResult, error)
+	DailyUsage(context.Context, dailyUsageQuery) (dailyUsageReport, error)
 	SessionUsage(context.Context, sessionUsageQuery) (*sessionUsageOutput, int, error)
 	MachineLabels(context.Context) (service.MachineLabelCatalog, error)
 }
@@ -51,6 +51,15 @@ type sessionUsageQuery struct {
 	SessionID string
 	OwnOnly   bool
 	NoSync    bool
+}
+
+// dailyUsageReport is a daily usage result plus the sessions its token and
+// cost totals leave out as billed to plan usage and the sessions whose
+// token counts miss turns live capture did not see.
+type dailyUsageReport struct {
+	db.DailyUsageResult
+	PlanOnlySessions       int
+	PartlyCapturedSessions int
 }
 
 type dailyUsageQuery struct {
@@ -216,7 +225,7 @@ func (b daemonArchiveQueryBackend) ActivityReport(
 func (b daemonArchiveQueryBackend) DailyUsage(
 	ctx context.Context,
 	query dailyUsageQuery,
-) (db.DailyUsageResult, error) {
+) (dailyUsageReport, error) {
 	return fetchHTTPDailyUsage(ctx, b.tr, b.authToken, query)
 }
 
@@ -256,7 +265,7 @@ func (b localArchiveQueryBackend) ActivityReport(
 func (b localArchiveQueryBackend) DailyUsage(
 	ctx context.Context,
 	query dailyUsageQuery,
-) (db.DailyUsageResult, error) {
+) (dailyUsageReport, error) {
 	ensureFreshData(ctx, b.cfg, b.database, b.skipFreshData)
 	ensureUsagePricing(
 		b.database, b.offline, b.cfg.CustomModelPricing,
@@ -265,9 +274,21 @@ func (b localArchiveQueryBackend) DailyUsage(
 	var err error
 	filter.Machine, err = db.ResolveMachineFilter(ctx, b.database, filter.Machine)
 	if err != nil {
-		return db.DailyUsageResult{}, err
+		return dailyUsageReport{}, err
 	}
-	return b.database.GetDailyUsage(ctx, filter)
+	result, err := b.database.GetDailyUsage(ctx, filter)
+	if err != nil {
+		return dailyUsageReport{}, err
+	}
+	planUsage, err := b.database.GetPlanUsageSessionCounts(ctx, filter)
+	if err != nil {
+		return dailyUsageReport{}, err
+	}
+	return dailyUsageReport{
+		DailyUsageResult:       result,
+		PlanOnlySessions:       planUsage.PlanOnly,
+		PartlyCapturedSessions: planUsage.PartlyCaptured,
+	}, nil
 }
 
 func (b localArchiveQueryBackend) MachineLabels(
@@ -374,10 +395,7 @@ func (b localArchiveQueryBackend) SessionUsage(
 			u.Agent = string(def.Type)
 		}
 	}
-	return &sessionUsageOutput{
-		SessionUsage:  *u,
-		ServerRunning: false,
-	}, usageExitCode(u), nil
+	return newStoreSessionUsageOutput(u), usageExitCode(u), nil
 }
 
 func closeArchiveQueryBackend(cleanup func()) {
