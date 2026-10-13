@@ -19,6 +19,7 @@ var hostedProjectionPrivileges = []struct{ table, privileges string }{
 	{"tool_calls", "SELECT,INSERT"},
 	{"tool_result_events", "SELECT,INSERT"},
 	{"usage_events", "SELECT,INSERT"},
+	{"session_plan_usage", "SELECT,INSERT"},
 	{"secret_findings", "SELECT,INSERT"},
 	{"excluded_sessions", "SELECT,INSERT,UPDATE"},
 	{"session_aliases", "SELECT"},

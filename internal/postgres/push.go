@@ -1280,11 +1280,23 @@ func (s *Sync) pushBatchAttempt(
 			return batchResult{}, nil
 		}
 
-		// Bump updated_at when messages or secret findings were
-		// rewritten but pushSession was a metadata no-op (its
-		// WHERE clause skips unchanged rows). PG read-mode session
-		// watchers rely on updated_at to surface secret-only changes.
-		if msgCount > 0 || findingsChanged {
+		planUsageChanged, err := s.replacePlanUsage(ctx, tx, sess.ID)
+		if err != nil {
+			log.Printf(
+				"pgsync: plan usage %s: %v",
+				sess.ID, err,
+			)
+			_ = tx.Rollback()
+			*pushed = (*pushed)[:len(*pushed)-n]
+			return batchResult{}, nil
+		}
+
+		// Bump updated_at when messages, secret findings, or plan
+		// usage were rewritten but pushSession was a metadata no-op
+		// (its WHERE clause skips unchanged rows). PG read-mode
+		// session watchers rely on updated_at to surface these
+		// changes.
+		if msgCount > 0 || findingsChanged || planUsageChanged {
 			if _, err := tx.ExecContext(ctx, `
 				UPDATE sessions
 				SET updated_at = NOW()
