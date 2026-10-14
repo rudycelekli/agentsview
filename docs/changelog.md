@@ -87,6 +87,8 @@ The latest release is
 
 **Bug fixes**
 
+- The Usage page loads faster by starting model comparison alongside totals.
+  The pairwise comparison API accepts both sides omitted and selects a default pair.
 - DeepSeek Harness v4 sessions now appear after sync, with tool results and
   recorded token usage.
 - ClickHouse usage reports read prepared usage again for a machine whose
