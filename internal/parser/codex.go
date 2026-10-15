@@ -1913,11 +1913,17 @@ func codexForkBaseInherited(payload gjson.Result, base, forkedFromID string) boo
 // forked thread's base can lie in history it inherited, which may belong to a
 // thread further up the fork chain; the page then continues the thread it was
 // forked from.
+//
+// The header id may be the thread (current builds) or the page's own rollout
+// (Desktop 0.148.0-alpha.15 through 0.154.0-alpha.6.2); the file name decides
+// which thread the page belongs to. A header id matching neither is no page.
 func codexRevertPage(
-	path, threadID, baseRollout, forkedFromID string, inherited bool,
+	path, headerID, baseRollout, forkedFromID string, inherited bool,
 ) (id, parentID string, ok bool) {
 	key := CodexSessionUUIDFromFilename(filepath.Base(path))
-	if threadID == "" || key == threadID || CodexThreadIDFromSessionKey(key) != threadID {
+	threadID := CodexThreadIDFromSessionKey(key)
+	if headerID == "" || key == threadID ||
+		(headerID != threadID && key != threadID+"_"+headerID) {
 		return "", "", false
 	}
 	parent := threadID
@@ -2022,11 +2028,13 @@ func (p *codexProvider) parseCodexSessionSnapshotStreaming(
 	}
 
 	sessionID := b.sessionID
+	titleKey := b.sessionID
 	parentSessionID, relationshipType := b.parentSessionID, b.relationshipType
 	if pageID, pageParent, ok := codexRevertPage(
 		path, b.sessionID, b.historyBase, b.forkedFromID, b.forkBaseInherited,
 	); ok {
 		sessionID = pageID
+		titleKey = pageID
 		parentSessionID, relationshipType = pageParent, RelContinuation
 	}
 	if sessionID == "" {
@@ -2055,7 +2063,7 @@ func (p *codexProvider) parseCodexSessionSnapshotStreaming(
 	sessionName := ""
 	sessionNamePresent := false
 	if p.spec.agent == AgentCodex {
-		sessionName, sessionNamePresent, _ = p.sources.metadata.ReadThreadName(path, b.sessionID)
+		sessionName, sessionNamePresent, _ = p.sources.metadata.ReadThreadName(path, titleKey)
 	}
 	if !sessionNamePresent && sessionName == "" && b.firstMessage == "" &&
 		b.relationshipType == RelSubagent {

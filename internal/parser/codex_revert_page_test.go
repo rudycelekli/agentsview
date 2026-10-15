@@ -73,6 +73,9 @@ func TestCodexRevertPageParentFollowsHistoryBase(t *testing.T) {
 		{"base_is_thread", AgentCodex, revertThread, revertThread, "codex:" + pageKey, "codex:" + revertThread, RelContinuation},
 		{"base_is_rollout", AgentCodex, revertThread, revertRollout1, "codex:" + pageKey, "codex:" + revertThread + "_" + revertRollout1, RelContinuation},
 		{"no_base", AgentCodex, revertThread, "", "codex:" + pageKey, "codex:" + revertThread, RelContinuation},
+		{"legacy_header_base_is_thread", AgentCodex, revertRollout, revertThread, "codex:" + pageKey, "codex:" + revertThread, RelContinuation},
+		{"legacy_header_base_is_rollout", AgentCodex, revertRollout, revertRollout1, "codex:" + pageKey, "codex:" + revertThread + "_" + revertRollout1, RelContinuation},
+		{"legacy_header_no_base", AgentCodex, revertRollout, "", "codex:" + pageKey, "codex:" + revertThread, RelContinuation},
 		{"header_disagrees", AgentCodex, revertOther, revertThread, "codex:" + revertOther, "", ""},
 		{"traex", AgentTraeX, revertThread, revertThread, "traex:" + pageKey, "traex:" + revertThread, RelContinuation},
 	}
@@ -141,6 +144,26 @@ func TestCodexRevertPageOfForkedThreadFollowsInheritedBase(t *testing.T) {
 			assert.Equal(t, 1, sess.MessageCount)
 		})
 	}
+}
+
+// Pages written by Desktop 0.148.0-alpha.15 through 0.154.0-alpha.6.2 name
+// their own rollout in the header; the file name still decides the thread, even
+// when session_id names an unrelated spawner, and the page takes the thread's
+// index title.
+func TestCodexLegacyHeaderRevertPageAttachesViaFilename(t *testing.T) {
+	home := t.TempDir()
+	root := filepath.Join(home, "sessions")
+	pageKey := revertThread + "_" + revertRollout
+	writeRevertRollout(t, root, pageKey,
+		revertPageMeta(revertRollout, "", map[string]any{"session_id": revertSpawner}),
+		testjsonl.CodexMsgJSON("user", "page prompt", "2026-09-01T11:00:01Z"),
+	)
+	writeIndex(t, home, `{"id":"`+revertThread+`","thread_name":"Thread title"}`+"\n", time.Now())
+
+	sess := parseRevertSource(t, AgentCodex, root, pageKey)
+	assert.Equal(t, "codex:"+pageKey, sess.ID)
+	assert.Equal(t, "codex:"+revertThread, sess.ParentSessionID)
+	assert.Equal(t, "Thread title", sess.SessionName)
 }
 
 func TestCodexRevertPageHelperRejectsNonPages(t *testing.T) {
