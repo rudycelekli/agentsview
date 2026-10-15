@@ -32,6 +32,19 @@ func newWorkBuddySourceSet(roots []string) JSONLSourceSet {
 	)
 }
 
+func workBuddySubagentTranscriptPaths(ctx context.Context, root string) ([]string, error) {
+	providerRoot := filepath.Dir(filepath.Dir(filepath.Dir(root)))
+	sources, err := NewJSONLSourceSet(AgentWorkBuddy, []string{root},
+		WithSymlinkFollowing(),
+		WithIncludePath(func(_, path string) bool { return isWorkBuddySourcePath(providerRoot, path) }),
+	).Discover(ctx)
+	paths := make([]string, 0, len(sources))
+	for _, source := range sources {
+		paths = append(paths, source.DisplayPath)
+	}
+	return paths, err
+}
+
 func workBuddyParseFile(
 	_ context.Context, path string, req ParseRequest,
 ) ([]ParseResult, []string, error) {

@@ -1,6 +1,7 @@
 package servicehttp
 
 import (
+	"encoding/json/v2"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -28,6 +29,31 @@ func TestWatchFiltersSessionReady(t *testing.T) {
 		got = append(got, event)
 	}
 	assert.Equal(t, []service.Event{{Event: "session_updated", Data: "session-a"}, {Event: "heartbeat", Data: "tick"}}, got)
+}
+
+func TestSyncUsageRefreshWireField(t *testing.T) {
+	calls := 0
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls++
+		assert.Equal(t, "/api/v1/sessions/sync", r.URL.Path)
+		var input map[string]any
+		if !assert.NoError(t, json.UnmarshalRead(r.Body, &input)) {
+			return
+		}
+		assert.Equal(t, "session", input["id"])
+		if _, present := input["usage_refresh"]; present {
+			http.Error(w, "unknown property usage_refresh", http.StatusUnprocessableEntity)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":"session"}`))
+	}))
+	t.Cleanup(srv.Close)
+	out, err := NewHTTPBackend(srv.URL, "", false, "").Sync(t.Context(), service.SyncInput{ID: "session"})
+	require.NoError(t, err)
+	require.NotNil(t, out)
+	assert.Equal(t, "session", out.ID)
+	assert.Equal(t, 1, calls)
 }
 
 func TestNewHTTPBackendUsesLongRunningClient(t *testing.T) {

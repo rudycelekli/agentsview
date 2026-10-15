@@ -6,4 +6,6 @@ export interface ServiceSyncInput {
   id?: string;
   path?: string;
   subagents?: boolean;
+  /** Bound refresh waits and report ingestion failures for usage queries */
+  usage_refresh?: boolean;
 }

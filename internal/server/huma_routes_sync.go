@@ -267,8 +267,11 @@ func (s *Server) humaTriggerSync(
 		if err != nil {
 			return nil, err
 		}
-		if err := s.rejectStaleArchiveForSync(); err != nil {
-			return nil, err
+		// General /sync keeps its in-process rebuild when no worker runner is configured.
+		if s.localSyncRunner != nil {
+			if err := s.rejectStaleArchiveForSync(); err != nil {
+				return nil, err
+			}
 		}
 	}
 	return &huma.StreamResponse{Body: func(hctx huma.Context) {
@@ -328,9 +331,7 @@ func (s *Server) runSyncWhenReady(
 	}
 }
 
-// ResyncRequiredHeader marks a /sync rejection that requires a full resync, so
-// the CLI can retry through /api/v1/resync instead of surfacing a raw HTTP
-// error. The body remains the human-readable explanation.
+// ResyncRequiredHeader marks a rejected sync that requires a full archive rebuild.
 const ResyncRequiredHeader = "X-Agentsview-Resync-Required"
 
 func (s *Server) archiveStale() bool {
@@ -338,16 +339,8 @@ func (s *Server) archiveStale() bool {
 	return ok && local.NeedsResync()
 }
 
-// rejectStaleArchiveForSync fails a worker-backed /sync when the archive's data
-// version changed, because the worker sync pass refuses to swap a stale archive
-// under the live daemon. It points the caller at /resync, which rebuilds through
-// the resync-build flow; it deliberately does not auto-trigger a resync. The
-// in-process path (no worker runner) safely resyncs a stale archive itself, so
-// the gate only applies when the worker-backed runner is wired.
+// rejectStaleArchiveForSync routes targeted syncs and worker-backed syncs to a full rebuild.
 func (s *Server) rejectStaleArchiveForSync() error {
-	if s.localSyncRunner == nil {
-		return nil
-	}
 	local, ok := s.db.(*db.DB)
 	if !ok || !local.NeedsResync() {
 		return nil
@@ -355,7 +348,7 @@ func (s *Server) rejectStaleArchiveForSync() error {
 	return huma.ErrorWithHeaders(
 		apiError(
 			http.StatusConflict,
-			"archive data version changed; POST /api/v1/resync to rebuild the "+
+			"archive data version changed; run agentsview resync or POST /api/v1/resync to rebuild the "+
 				"archive before syncing",
 		),
 		http.Header{ResyncRequiredHeader: []string{"true"}},
@@ -1070,7 +1063,11 @@ func (s *Server) humaSyncSession(
 	if in.Body.Subagents && in.Body.ID == "" {
 		return nil, apiError(http.StatusBadRequest, "'subagents' requires 'id'")
 	}
-	if err := s.resyncBeforeSessionSync(ctx); err != nil {
+	if in.Body.UsageRefresh {
+		if err := s.rejectStaleArchiveForSync(); err != nil {
+			return nil, err
+		}
+	} else if err := s.resyncBeforeSessionSync(ctx); err != nil {
 		if errors.Is(err, context.Canceled) {
 			return nil, nil
 		}
@@ -1089,6 +1086,15 @@ func (s *Server) humaSyncSession(
 		}
 		if handled := handleHumaReadOnly(err); handled != nil {
 			return nil, handled
+		}
+		if errors.Is(err, syncpkg.ErrSubagentRefreshIncomplete) {
+			return nil, apiError(
+				http.StatusConflict,
+				"another sync or maintenance pass started after the parent refresh, so subagents were skipped and the usage aggregate may be incomplete. Retry after that pass finishes",
+			)
+		}
+		if errors.Is(err, syncpkg.ErrSyncInProgress) {
+			return nil, apiError(http.StatusConflict, "sync or maintenance is already running; retry the session refresh after it finishes")
 		}
 		if errors.Is(err, db.ErrSessionExcluded) ||
 			errors.Is(err, db.ErrSessionTrashed) {

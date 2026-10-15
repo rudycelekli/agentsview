@@ -87,16 +87,11 @@ func resolveArchiveQueryBackendWithConfig(
 			case !tr.ReadOnly,
 				policy.ReadOnlyDaemon == archiveQueryUseReadOnlyDaemon:
 				if policy.AutoStart && !policy.SkipInitialSync && !policy.NoSync && !tr.ReadOnly {
-					progress := newResyncProgressPrinter(os.Stderr, time.Now)
-					_, err := postDaemonPush[sync.SyncStats](ctx, tr, cfg.AuthToken,
-						startupSyncOperation, apiclient.DaemonPushRequest{}, progress.Print)
-					progress.Finish()
-					if err != nil {
-						return nil, nil, fmt.Errorf("waiting for startup sync: %w", err)
+					if err := waitForArchiveStartup(ctx, tr, cfg.AuthToken); err != nil {
+						return nil, nil, err
 					}
 				}
-				return daemonArchiveQueryBackend{tr: tr, authToken: cfg.AuthToken},
-					func() {}, nil
+				return daemonArchiveQueryBackend{tr: tr, authToken: cfg.AuthToken}, func() {}, nil
 			case policy.ReadOnlyDaemon == archiveQueryRejectReadOnlyDaemon:
 				return nil, nil, readOnlySessionUsageDaemonError(tr.URL)
 			case policy.ReadOnlyDaemon == archiveQuerySkipReadOnlyDaemon:
@@ -134,21 +129,35 @@ func resolveArchiveQueryBackendWithConfig(
 	}, cleanup, nil
 }
 
+func waitForArchiveStartup(ctx context.Context, tr transport, authToken string) error {
+	progress := newResyncProgressPrinter(os.Stderr, time.Now)
+	_, err := postDaemonPush[sync.SyncStats](ctx, tr, authToken,
+		startupSyncOperation, apiclient.DaemonPushRequest{}, progress.Print)
+	progress.Finish()
+	if err != nil {
+		return fmt.Errorf("waiting for startup sync: %w", err)
+	}
+	return nil
+}
+
 func resolveArchiveQueryTransport(
 	ctx context.Context,
 	cfg *config.Config,
 	policy archiveQueryPolicy,
 ) (transport, error) {
+	var tr transport
+	var err error
 	if policy.AutoStart && !policy.NoSync {
-		// Daily reports can read committed data while sync runs after
-		// readiness. Session-specific commands still need startup ingestion.
+		// Usage queries can read committed data while daemon-owned sync runs.
 		cfg.SkipInitialSync = policy.SkipInitialSync
-		return ensureTransportContext(ctx, cfg, transportIntentArchiveWrite, 0)
+		tr, err = ensureTransportContext(ctx, cfg, transportIntentArchiveWrite, 0)
+	} else {
+		if policy.NoSync {
+			cfg.NoSync = true
+		}
+		tr, err = ensureTransportContext(ctx, cfg, transportIntentRead, 0)
 	}
-	if policy.NoSync {
-		cfg.NoSync = true
-	}
-	return ensureTransportContext(ctx, cfg, transportIntentRead, 0)
+	return tr, err
 }
 
 func directReadOnlyArchiveQueryError(
@@ -224,7 +233,7 @@ func (b daemonArchiveQueryBackend) SessionUsage(
 	ctx context.Context,
 	query sessionUsageQuery,
 ) (*sessionUsageOutput, int, error) {
-	return httpSessionUsageData(ctx, b.tr.URL, b.authToken, query)
+	return httpSessionUsageData(ctx, b.tr, b.authToken, query)
 }
 
 func (b daemonArchiveQueryBackend) MachineLabels(
@@ -308,7 +317,11 @@ func (b localArchiveQueryBackend) SessionUsage(
 		ctx, b.database, b.cfg.AgentDirs, query.SessionID,
 	)
 
-	if known && !b.skipFreshData && !query.NoSync {
+	stale := b.database.NeedsResync()
+	if stale && !b.skipFreshData && !query.NoSync {
+		fmt.Fprintln(os.Stderr, "warning: archive needs resync; run agentsview resync; showing stored usage, which may be incomplete")
+	}
+	if known && !stale && !b.skipFreshData && !query.NoSync {
 		engine := sync.NewEngine(ctx, b.database, sync.EngineConfig{
 			AgentDirs:               b.cfg.AgentDirs,
 			SourceMachines:          b.cfg.SourceMachines,
@@ -320,15 +333,15 @@ func (b localArchiveQueryBackend) SessionUsage(
 			BlockedResultCategories: b.cfg.ResultContentBlockedCategories,
 			ArchiveContent:          b.cfg.ArchiveContent,
 		})
-		var syncErr error
-		if query.OwnOnly {
-			syncErr = engine.SyncSingleSessionContext(ctx, resolvedID)
-		} else {
-			syncErr = engine.SyncSessionWithSubagentsContext(ctx, resolvedID)
+		refreshed, syncErr := service.NewDirectBackend(b.database, engine).Sync(ctx, service.SyncInput{
+			ID: resolvedID, Subagents: !query.OwnOnly, UsageRefresh: true,
+		})
+		if syncErr == nil && refreshed != nil {
+			resolvedID = refreshed.ID
 		}
 		if syncErr != nil {
 			fmt.Fprintf(os.Stderr,
-				"warning: sync failed: %v\n", syncErr)
+				"warning: sync failed: %v; showing stored usage, which may be incomplete\n", syncErr)
 		}
 		// Flush pending debounced signal recomputes before the
 		// usage query reads the session.
@@ -349,8 +362,7 @@ func (b localArchiveQueryBackend) SessionUsage(
 			fmt.Errorf("querying session usage: %w", err)
 	}
 	if u == nil {
-		fmt.Fprintf(os.Stderr, "session not found: %s\n", query.SessionID)
-		return nil, tokenUseExitNotFound, nil
+		return sessionUsageNotFound(query.SessionID)
 	}
 	if len(u.UnpricedModels) > 0 && !b.offline {
 		refreshed, refErr := pricingrefresh.RefreshIfStale(

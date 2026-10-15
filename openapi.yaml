@@ -6759,6 +6759,9 @@ components:
           type: string
         subagents:
           type: boolean
+        usage_refresh:
+          description: Bound refresh waits and report ingestion failures for usage queries
+          type: boolean
       type: object
     ServiceToolCall:
       additionalProperties: false

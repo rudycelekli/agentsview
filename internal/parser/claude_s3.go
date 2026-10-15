@@ -97,19 +97,9 @@ func claudeS3Scanner() S3SessionScanner {
 // swallowing filesystem errors: the caller's usage query degrades to stale
 // delegated totals instead of failing.
 func claudeS3SubagentTranscriptPaths(sessionPath string) []string {
-	base := sessionPath[strings.LastIndex(sessionPath, "/")+1:]
-	stem := strings.TrimSuffix(base, ".jsonl")
-	if stem == "" {
+	prefix := ClaudeSubagentTranscriptRoot(sessionPath)
+	if prefix == "" {
 		return nil
-	}
-	prefix := strings.TrimSuffix(sessionPath, ".jsonl") + "/subagents"
-	if strings.HasPrefix(stem, "agent-") {
-		const marker = "/subagents/"
-		before, _, ok := strings.CutLast(sessionPath, marker)
-		if !ok {
-			return nil
-		}
-		prefix = before + "/subagents"
 	}
 	objects, err := listS3Objects(prefix)
 	if err != nil {

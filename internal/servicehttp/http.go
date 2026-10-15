@@ -618,7 +618,11 @@ func (b *httpBackend) Sync(
 	if err != nil {
 		return nil, err
 	}
-	response, err := api.PostAPIV1SessionsSyncWithResponse(ctx, &apiclient.PostAPIV1SessionsSyncRequestOptions{Body: &apiclient.PostAPIV1SessionsSyncBody{ID: new(in.ID), Path: new(in.Path), Subagents: new(in.Subagents)}})
+	body := &apiclient.PostAPIV1SessionsSyncBody{ID: new(in.ID), Path: new(in.Path), Subagents: new(in.Subagents)}
+	if in.UsageRefresh {
+		body.UsageRefresh = new(true)
+	}
+	response, err := api.PostAPIV1SessionsSyncWithResponse(ctx, &apiclient.PostAPIV1SessionsSyncRequestOptions{Body: body})
 	if response == nil {
 		return nil, err
 	}

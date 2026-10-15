@@ -596,6 +596,19 @@ sessions already present there.
   detached daemon when no compatible daemon is running. It then proxies to
   `POST /api/v1/sessions/sync` so parsing and signal computation remain
   daemon-owned.
+- A usage refresh against a stale archive returns HTTP 409 with
+  `X-Agentsview-Resync-Required: true`. Run `agentsview resync` before retrying.
+  Ordinary session sync rebuilds the archive inline.
+- An ID-based refresh with `subagents=true` or `usage_refresh=true` waits briefly
+  for a busy engine, then returns HTTP 409 if the sync or maintenance pass
+  continues. If a pass
+  starts between the parent and child refreshes, the response says the usage
+  aggregate may be incomplete. Ordinary ID and path syncs wait for that pass to
+  finish.
+- Usage refresh reports ingestion failures and returns the replacement session
+  ID when Vibe metadata changes its identity. Combined usage refreshes archived
+  descendant sources and Codex children named by spawn records without startup
+  ingestion. Source-missing ancestors retain their available descendants.
 - If a [`pg serve`](/docs/pg-sync/#agentsview-pg-serve) daemon is running
   (read-only), sync refuses with a clear error.
 - If `AGENTSVIEW_NO_DAEMON=1` is set, the CLI runs the sync in-process only
@@ -1053,7 +1066,11 @@ did before.
 
 Before querying, the local backend refreshes the session's own transcript and
 the `agent-*.jsonl` files under its `subagents/` directory, so a session that
-just finished reports complete numbers. `--own-only` skips the subagent refresh.
+just finished reports complete numbers. With `--own-only`, queries refresh only
+the named transcript. Stale archives skip the refresh and show stored usage with
+a warning to run `agentsview resync`. Servers below API 12 skip targeted refresh
+with a warning to restart or upgrade. Servers newer than this client require a
+client upgrade before querying usage.
 
 Pass `--no-sync` to read archived usage without refreshing source transcripts.
 This preserves the full subagent rollup and the exit codes above; combine it

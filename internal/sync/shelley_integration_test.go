@@ -200,6 +200,39 @@ func TestSyncSingleSessionShelleyUsesVirtualSourcePath(t *testing.T) {
 		database.GetSessionFilePath(t.Context(), "shelley:cMAIN1"), "stored file path")
 }
 
+func TestSyncSessionWithSubagentsDiscoversShelleyChildrenBeforeStartupSync(t *testing.T) {
+	dir := t.TempDir()
+	dbPath := createShelleyMainDB(t, dir)
+	engine, database := newShelleyEngine(t, dir)
+	t.Cleanup(engine.Close)
+	require.NoError(t, engine.SyncSingleSession("shelley:cMAIN1"))
+
+	for _, conv := range []struct{ id, parent string }{
+		{"child", "cMAIN1"},
+		{"grandchild", "child"},
+		{"unrelated", ""},
+	} {
+		seedShelleyConvo(t, dbPath, conv.id, conv.id, "/workspace/project-a",
+			"claude-sonnet-4-6", conv.parent, false,
+			"2026-06-15T10:00:00Z", "2026-06-15T10:00:06Z", mainConvoMsgs())
+	}
+
+	require.False(t, engine.StartupReconciled())
+	require.NoError(t, engine.SyncSessionWithSubagentsContext(t.Context(), "shelley:cMAIN1"))
+	assert.False(t, engine.StartupReconciled())
+	children, err := database.GetChildSessions(t.Context(), "shelley:cMAIN1")
+	require.NoError(t, err)
+	require.Len(t, children, 1)
+	assert.Equal(t, "shelley:child", children[0].ID)
+	grandchildren, err := database.GetChildSessions(t.Context(), children[0].ID)
+	require.NoError(t, err)
+	require.Len(t, grandchildren, 1)
+	assert.Equal(t, "shelley:grandchild", grandchildren[0].ID)
+	unrelated, err := database.GetSession(t.Context(), "shelley:unrelated")
+	require.NoError(t, err)
+	assert.Nil(t, unrelated)
+}
+
 func TestSyncSingleSessionShelleyForceRewritesUnchangedSession(t *testing.T) {
 	dir := t.TempDir()
 	dbPath := createShelleyMainDB(t, dir)

@@ -38,6 +38,59 @@ type cursorS3Transcript struct {
 	file DiscoveredFile
 }
 
+// CursorS3SourceRoot returns the source root containing a Cursor transcript.
+func CursorS3SourceRoot(sessionPath string, configuredRoots ...string) string {
+	for _, root := range CursorS3SourceRoots(configuredRoots) {
+		if rel, ok := s3RelativePath(root, sessionPath); ok {
+			if _, ok := cursorS3TranscriptLocation(strings.Split(rel, "/")); ok {
+				return strings.TrimSuffix(root, "/")
+			}
+		}
+	}
+	parts := strings.Split(sessionPath, "/")
+	// A marker-named parent can also make its nested transcript look flat.
+	for i := 1; i < len(parts); i++ {
+		if parts[i] == "agent-transcripts" {
+			if _, ok := parseCursorTranscriptRelParts(parts[i-1:]); ok {
+				return strings.Join(parts[:i-1], "/")
+			}
+		}
+	}
+	return ""
+}
+
+// CursorS3SubagentRoot returns the native child prefix for any supported parent layout.
+func CursorS3SubagentRoot(sourceRoot, sessionPath string) string {
+	rel, ok := s3RelativePath(sourceRoot, sessionPath)
+	if !ok || sourceRoot == "" {
+		return ""
+	}
+	loc, ok := cursorS3TranscriptLocation(strings.Split(rel, "/"))
+	if !ok {
+		return ""
+	}
+	return strings.TrimSuffix(sourceRoot, "/") + "/" + loc.ProjectDir + "/agent-transcripts/" + loc.RawID + "/" + cursorSubagentsDirName
+}
+
+// DiscoverCursorS3SubagentPaths indexes canonical children by their subagent directory URI.
+func DiscoverCursorS3SubagentPaths(ctx context.Context, sourceRoot string) (map[string][]string, error) {
+	byRoot, err := discoverCursorS3ByRoot(ctx, []string{sourceRoot})
+	if err != nil {
+		return nil, err
+	}
+	paths := make(map[string][]string)
+	for _, file := range byRoot[sourceRoot] {
+		if cursorS3LayoutRank(file.Path) == cursorS3LayoutSubagent {
+			root, _, _ := strings.CutLast(file.Path, "/")
+			paths[root] = append(paths[root], file.Path)
+		}
+	}
+	for _, children := range paths {
+		slices.Sort(children)
+	}
+	return paths, nil
+}
+
 func discoverCursorS3ByRoot(
 	ctx context.Context, roots []string,
 ) (map[string][]DiscoveredFile, error) {

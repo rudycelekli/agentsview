@@ -975,9 +975,18 @@ server's normal write timeout. Press Ctrl+C to stop waiting; shared cache work
 can continue in the daemon.
 
 Restart older daemons after upgrading so they provide the usage progress
-endpoint. `session usage`, `token-use`, and `usage statusline` still wait for
-initial sync, including when they reuse a daemon started by daily usage.
-Statusline limits the complete wait and report request to 30 seconds.
+endpoint. Session usage refreshes the named session and its subagents without
+starting or waiting for full startup ingestion. When a stale archive refuses the
+refresh, the command shows stored usage with a warning to run `agentsview resync`.
+A busy sync or maintenance pass returns stored usage with a warning that the
+aggregate may be incomplete.
+
+A session the archive does not have yet is imported from its source before the
+usage lookup. IDs with no source return "session not found" and exit 2.
+`--own-only` refreshes only the named transcript and excludes subagents.
+Servers below API 12 skip targeted refresh with a warning to restart or upgrade.
+Servers newer than this client require a client upgrade before querying usage.
+Statusline waits for startup sync with a 30-second deadline.
 
 Offline reads require an archive at the current data version. If an upgrade
 requires a resync, run `agentsview daemon restart` and let the resync finish

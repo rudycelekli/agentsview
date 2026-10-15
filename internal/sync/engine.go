@@ -1952,16 +1952,16 @@ func (e *Engine) parsePolicyContext(ctx context.Context) context.Context {
 
 // file watcher threads the serve shutdown context through here.
 func (e *Engine) SyncPathsContext(ctx context.Context, paths []string) error {
-	return e.syncPathsContext(ctx, paths, false)
+	return e.syncPathsContext(ctx, paths, false, true)
 }
 
 // ReparsePathsContext fully parses only the selected sources, retaining the
 // normal publication rules and bounded-memory staging for large Codex files.
 func (e *Engine) ReparsePathsContext(ctx context.Context, paths []string) error {
-	return e.syncPathsContext(ctx, paths, true)
+	return e.syncPathsContext(ctx, paths, true, true)
 }
 
-func (e *Engine) syncPathsContext(ctx context.Context, paths []string, force bool) error {
+func (e *Engine) syncPathsContext(ctx context.Context, paths []string, force, wait bool) error {
 	if e.sourceSyncErr != nil {
 		return e.sourceSyncErr
 	}
@@ -1970,7 +1970,11 @@ func (e *Engine) syncPathsContext(ctx context.Context, paths []string, force boo
 	}
 	ctx = e.parsePolicyContext(ctx)
 	stats, tombstoned, err := func() (SyncStats, int, error) {
-		e.syncMu.Lock()
+		if wait {
+			e.syncMu.Lock()
+		} else if err := e.lockForSessionRefresh(ctx); err != nil {
+			return SyncStats{}, 0, err
+		}
 		defer e.syncMu.Unlock()
 		defer e.clearCurrentProgress()
 		previous := e.forceFullParse
@@ -4891,6 +4895,29 @@ func (e *Engine) RunExclusive(work func() error) error {
 // ErrSyncInProgress reports that non-blocking foreground sync coordination
 // found another sync or maintenance pass holding the exclusive engine lock.
 var ErrSyncInProgress = errors.New("sync already in progress")
+
+// lockForSessionRefresh waits briefly for watcher writes, then returns busy.
+func (e *Engine) lockForSessionRefresh(ctx context.Context) error {
+	deadline := time.NewTimer(250 * time.Millisecond)
+	defer deadline.Stop()
+	retry := time.NewTicker(10 * time.Millisecond)
+	defer retry.Stop()
+	for {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		if e.syncMu.TryLock() {
+			return nil
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-deadline.C:
+			return ErrSyncInProgress
+		case <-retry.C:
+		}
+	}
+}
 
 // TryRunExclusive is the non-blocking foreground counterpart to RunExclusive.
 // Background work keeps using RunExclusive so scheduled obligations are not
@@ -20272,8 +20299,7 @@ func (e *Engine) FindSourceFile(ctx context.Context, sessionID string) string {
 		if fp := e.db.GetSessionFilePath(ctx, sessionID); isS3SourcePath(fp) {
 			return fp
 		}
-		// Remote sessions have no local source file.
-		return ""
+		return e.findS3SourceFile(ctx, sessionID)
 	}
 
 	def, ok := parser.AgentByPrefix(sessionID)
@@ -20837,6 +20863,19 @@ func (e *Engine) SyncSingleSession(sessionID string) (err error) {
 // cancellable git-backed project resolution and database reads on this path.
 func (e *Engine) SyncSingleSessionContext(
 	ctx context.Context, sessionID string,
+) error {
+	return e.syncSingleSessionContext(ctx, sessionID, true)
+}
+
+// SyncSingleSessionForUsageContext bounds lock waiting for a usage refresh.
+func (e *Engine) SyncSingleSessionForUsageContext(
+	ctx context.Context, sessionID string,
+) error {
+	return e.syncSingleSessionContext(ctx, sessionID, false)
+}
+
+func (e *Engine) syncSingleSessionContext(
+	ctx context.Context, sessionID string, wait bool,
 ) (err error) {
 	if e.sourceSyncErr != nil {
 		return e.sourceSyncErr
@@ -20848,7 +20887,11 @@ func (e *Engine) SyncSingleSessionContext(
 		)
 	}
 	ctx = e.parsePolicyContext(ctx)
-	e.syncMu.Lock()
+	if wait {
+		e.syncMu.Lock()
+	} else if err := e.lockForSessionRefresh(ctx); err != nil {
+		return err
+	}
 	preserved := false
 	sessionsChanged := false
 	// Defers run LIFO: unlock runs first (releasing syncMu), then
@@ -20865,13 +20908,6 @@ func (e *Engine) SyncSingleSessionContext(
 	defer e.syncMu.Unlock()
 	e.resetS3CodexIndexCache()
 	e.resetSourceClaims()
-
-	host, _ := parser.StripHostPrefix(sessionID)
-	if host != "" && !isS3SourcePath(e.db.GetSessionFilePath(ctx, sessionID)) {
-		return fmt.Errorf(
-			"cannot sync remote session %s locally", sessionID,
-		)
-	}
 
 	def, ok := parser.AgentByPrefix(sessionID)
 	if !ok {
@@ -20892,6 +20928,11 @@ func (e *Engine) SyncSingleSessionContext(
 	}
 
 	path := e.FindSourceFile(ctx, sessionID)
+	if host, _ := parser.StripHostPrefix(sessionID); host != "" && !isS3SourcePath(path) {
+		return fmt.Errorf(
+			"cannot sync remote session %s locally", sessionID,
+		)
+	}
 	if path == "" {
 		return fmt.Errorf(
 			"source file not found for %s", sessionID,

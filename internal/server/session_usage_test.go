@@ -561,7 +561,7 @@ func TestHandleSessionUsage_SubagentsParamCombinesInPlace(t *testing.T) {
 	assert.Equal(t, "message", childRow["source"])
 }
 
-func TestHandleSessionUsage_SubagentsRefreshesNewLocalTranscript(t *testing.T) {
+func TestHandleSessionUsage_SubagentsReadAndSyncOrigin(t *testing.T) {
 	te := setup(t)
 	projectDir := filepath.Join(te.claudeDir, "-home-proj")
 	subagentsDir := filepath.Join(
@@ -614,43 +614,6 @@ func TestHandleSessionUsage_SubagentsRefreshesNewLocalTranscript(t *testing.T) {
 
 	synced := te.post(t, "/api/v1/sessions/sync", body)
 	assertStatus(t, synced, http.StatusOK)
-
-	w = te.get(t,
-		"/api/v1/sessions/parent-uuid/usage?subagents=true")
-	assertStatus(t, w, http.StatusOK)
-	got = nil
-	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &got))
-	assert.InDelta(t, float64(1), got["subagent_count"], 0)
-
-	child, err = te.db.GetSession(ctx, "agent-worker1")
-	require.NoError(t, err)
-	require.NotNil(t, child, "subagent transcript was not synced")
-	require.NotNil(t, child.ParentSessionID)
-	assert.Equal(t, "parent-uuid", *child.ParentSessionID)
-}
-
-func TestHandleSessionUsage_SubagentRefreshFailureUsesArchivedUsage(t *testing.T) {
-	te := setup(t)
-	missingPath := filepath.Join(
-		te.claudeDir, "-home-proj", "missing-parent.jsonl")
-	te.seedSession(t, "missing-parent", "project", 1, func(s *db.Session) {
-		s.Agent = "claude"
-		s.FilePath = &missingPath
-	})
-	te.seedMessages(t, "missing-parent", 1, func(_ int, m *db.Message) {
-		m.Role = "assistant"
-		m.Model = "claude-sonnet-4-5"
-		m.TokenUsage = jsontext.Value(
-			`{"input_tokens":1000,"output_tokens":500}`)
-	})
-
-	w := te.get(t,
-		"/api/v1/sessions/missing-parent/usage?subagents=true")
-	assertStatus(t, w, http.StatusOK)
-	var got map[string]any
-	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &got))
-	assert.Equal(t, "missing-parent", got["session_id"])
-	assert.InDelta(t, float64(1), got["breakdown_count"], 0)
 }
 
 // TestHandleSessionUsage_BreakdownRoundTripsWebSearchRequests pins that the

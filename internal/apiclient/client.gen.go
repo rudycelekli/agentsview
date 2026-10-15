@@ -24600,6 +24600,9 @@ type ServiceSyncInput struct {
 	ID        *string `json:"id,omitempty"`
 	Path      *string `json:"path,omitempty"`
 	Subagents *bool   `json:"subagents,omitempty"`
+
+	// UsageRefresh Bound refresh waits and report ingestion failures for usage queries
+	UsageRefresh *bool `json:"usage_refresh,omitempty"`
 }
 
 type ServiceToolCall struct {

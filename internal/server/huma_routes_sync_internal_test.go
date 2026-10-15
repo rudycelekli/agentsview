@@ -1789,44 +1789,91 @@ func TestCanceledForegroundSyncLeavesStartupFallbackEligible(t *testing.T) {
 		"a canceled HTTP sync must leave daemon startup recovery eligible")
 }
 
-func TestHumaSyncSessionLocalNoSyncResyncsStaleDB(t *testing.T) {
-	f := newSyncRouteFixture(t, withStaleDB())
-	sessionPath := f.writeClaudeSession(t, "proj/session.jsonl",
-		"stale session sync route")
-	require.True(t, f.db.NeedsResync())
-	w := postSessionSync(t, f.handler, sessionPath)
-
-	require.Equal(t, http.StatusOK, w.Code, "body: %s", w.Body.String())
-	assert.False(t, f.db.NeedsResync())
-	detail := decodeRecorder[service.SessionDetail](t, w)
-	assertFirstMessageContains(t, detail.FirstMessage, "stale session sync route")
+func TestHumaSyncSessionStaleArchive(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		input service.SyncInput
+	}{
+		{"path", service.SyncInput{}},
+		{"own usage", service.SyncInput{ID: "session", UsageRefresh: true}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newSyncRouteFixture(t, withStaleDB())
+			sessionPath := f.writeClaudeSession(t, "proj/session.jsonl", "stale session sync route")
+			input := tc.input
+			if input.ID == "" {
+				input.Path = sessionPath
+			}
+			require.True(t, f.db.NeedsResync())
+			w := serveJSON(t, f.handler, http.MethodPost, "/api/v1/sessions/sync", input)
+			if input.UsageRefresh {
+				require.Equal(t, http.StatusConflict, w.Code, "body: %s", w.Body.String())
+				assert.Equal(t, "true", w.Header().Get(ResyncRequiredHeader))
+				assert.True(t, f.db.NeedsResync())
+				session, err := f.db.GetSession(t.Context(), "session")
+				require.NoError(t, err)
+				assert.Nil(t, session)
+				return
+			}
+			require.Equal(t, http.StatusOK, w.Code, "body: %s", w.Body.String())
+			assert.Empty(t, w.Header().Get(ResyncRequiredHeader))
+			assert.False(t, f.db.NeedsResync())
+			detail := decodeRecorder[service.SessionDetail](t, w)
+			assertFirstMessageContains(t, detail.FirstMessage, "stale session sync route")
+		})
+	}
 }
 
-func TestHumaSyncSessionCanceledPreResyncReturnsNil(t *testing.T) {
-	f := newSyncRouteFixture(t, withStaleDB())
-	require.True(t, f.db.NeedsResync())
+type syncErrorSessionService struct {
+	service.SessionService
+	inputs []service.SyncInput
+}
 
-	ctx, cancel := context.WithCancel(t.Context())
-	cancel()
-	out, err := f.srv.humaSyncSession(ctx, &sessionSyncInput{
-		Body: service.SyncInput{Path: filepath.Join(f.dir, "missing.jsonl")},
-	})
+func (s *syncErrorSessionService) Sync(_ context.Context, input service.SyncInput) (*service.SessionDetail, error) {
+	s.inputs = append(s.inputs, input)
+	return nil, errors.Join(syncpkg.ErrSubagentRefreshIncomplete, syncpkg.ErrSyncInProgress)
+}
 
-	require.NoError(t, err)
-	assert.Nil(t, out)
+func TestHumaSyncSessionReportsIncompleteSubagentRefresh(t *testing.T) {
+	f := newSyncRouteFixture(t)
+	f.srv.engine = f.srv.syncEngineForLocal(t.Context(), f.db)
+	svc := &syncErrorSessionService{}
+	f.srv.sessions = svc
+	w := serveJSON(t, f.handler, http.MethodPost, "/api/v1/sessions/sync",
+		service.SyncInput{ID: "parent", Subagents: true, UsageRefresh: true})
+	require.Equal(t, http.StatusConflict, w.Code, "body: %s", w.Body.String())
+	assert.Contains(t, w.Body.String(), "subagents were skipped")
+	assert.Equal(t, []service.SyncInput{{ID: "parent", Subagents: true, UsageRefresh: true}}, svc.inputs)
 }
 
 func TestHumaSyncSessionCanceledServiceSyncReturnsNil(t *testing.T) {
-	f := newSyncRouteFixture(t)
-
-	ctx, cancel := context.WithCancel(t.Context())
-	cancel()
-	out, err := f.srv.humaSyncSession(ctx, &sessionSyncInput{
-		Body: service.SyncInput{Path: filepath.Join(f.dir, "missing.jsonl")},
-	})
-
-	require.NoError(t, err)
-	assert.Nil(t, out)
+	for _, duringResync := range []bool{false, true} {
+		t.Run(fmt.Sprintf("duringResync=%t", duringResync), func(t *testing.T) {
+			ctx, cancel := context.WithCancel(t.Context())
+			defer cancel()
+			ran := false
+			var options []syncRouteFixtureOption
+			if duringResync {
+				options = []syncRouteFixtureOption{withStaleDB(), withLocalResyncRunner(
+					func(ctx context.Context, _ func(syncpkg.Progress)) (syncpkg.SyncStats, error) {
+						require.NoError(t, ctx.Err())
+						ran = true
+						cancel()
+						return syncpkg.SyncStats{}, ctx.Err()
+					},
+				)}
+			} else {
+				cancel()
+			}
+			f := newSyncRouteFixture(t, options...)
+			out, err := f.srv.humaSyncSession(ctx, &sessionSyncInput{
+				Body: service.SyncInput{Path: filepath.Join(f.dir, "missing.jsonl")},
+			})
+			assert.Equal(t, duringResync, ran)
+			require.NoError(t, err)
+			assert.Nil(t, out)
+		})
+	}
 }
 
 func TestRunRemoteSyncRequestEmitsAfterRemoteOnlyWrites(t *testing.T) {

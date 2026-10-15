@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log"
 	"os"
 	"path"
 	"strings"
@@ -369,6 +370,59 @@ func s3RelFromRoot(root, uri string) (string, bool) {
 	return strings.TrimPrefix(uri, prefix+"/"), true
 }
 
+// First-use remote lookups list only matching configured S3 roots. Discovery
+// owns transcript selection and duplicate-format preferences; lookup never
+// materializes or imports the other objects in those roots.
+func (e *Engine) findS3SourceFile(ctx context.Context, sessionID string) string {
+	host, rawID := parser.StripHostPrefix(sessionID)
+	def, ok := parser.AgentByPrefix(sessionID)
+	if !ok || host == "" {
+		return ""
+	}
+	factory, ok := e.sources().providerFactories[def.Type]
+	if !ok || factory == nil || factory.Capabilities().Source.S3Discovery != parser.CapabilitySupported {
+		return ""
+	}
+	var roots []string
+	for _, root := range e.sources().agentDirs[def.Type] {
+		if isS3SourcePath(root) && s3MachineFromRoot(root) == host {
+			roots = append(roots, root)
+		}
+	}
+	if len(roots) == 0 {
+		return ""
+	}
+	provider := factory.NewProvider(parser.ProviderConfig{
+		Roots: roots, Machine: e.machine, PathRewriter: e.pathRewriter,
+	})
+	s3Provider, ok := provider.(parser.S3Provider)
+	if !ok {
+		return ""
+	}
+	sources, err := provider.Discover(e.parsePolicyContext(ctx))
+	if err != nil {
+		log.Printf("%s s3 source lookup: %v", def.Type, err)
+		return ""
+	}
+	selected := ""
+	for _, source := range sources {
+		s3Source, ok := source.Opaque.(parser.S3DiscoveredSource)
+		if !ok || s3Source.Machine != host {
+			continue
+		}
+		path := providerDiscoveredPath(source)
+		if isS3SourcePath(path) && s3Provider.S3SessionID(path) == rawID {
+			if def.Type != parser.AgentCodex {
+				return path
+			}
+			if selected == "" || parser.CodexS3URIPreferred(path, selected) {
+				selected = path
+			}
+		}
+	}
+	return selected
+}
+
 func (e *Engine) hydrateS3DiscoveredFile(
 	ctx context.Context, sessionID string, file *parser.DiscoveredFile,
 ) {
@@ -418,7 +472,7 @@ func (e *Engine) hydrateS3DiscoveredFile(
 	}
 }
 
-// SyncS3SubagentTranscriptsContext ingests the given s3:// Claude-compatible
+// SyncS3SubagentTranscriptsContext ingests the given provider-native s3://
 // subagent transcript objects. The changed-path pipeline
 // (SyncPathsContext) classifies by statting local files, so it cannot
 // route s3:// objects; the on-demand subagent refresh behind `session
@@ -439,10 +493,13 @@ func (e *Engine) SyncS3SubagentTranscriptsContext(
 	if e.refuseWriteInForceParse("SyncS3SubagentTranscripts") {
 		return nil
 	}
-	if !isClaudeFormatAgent(parentAgent) {
+	provider, ok := s3ProviderFor(parentAgent)
+	if !ok {
 		return fmt.Errorf("sync s3 subagent transcripts: unsupported parent agent %q", parentAgent)
 	}
-	e.syncMu.Lock()
+	if err := e.lockForSessionRefresh(ctx); err != nil {
+		return err
+	}
 	synced := false
 	sessionsChanged := false
 	// Defers run LIFO: emit runs after syncMu.Unlock, matching the
@@ -459,10 +516,11 @@ func (e *Engine) SyncS3SubagentTranscriptsContext(
 
 	parentMachine, _ := parser.StripHostPrefix(parentSessionID)
 	parentProject := ""
-	if parent, _ := e.db.GetSession(ctx, parentSessionID); parent != nil &&
-		parent.Project != "" &&
-		!parser.NeedsProjectReparse(parent.Project) {
-		parentProject = parent.Project
+	if parent, _ := e.db.GetSession(ctx, parentSessionID); parent != nil {
+		parentMachine = parent.Machine
+		if parent.Project != "" && !parser.NeedsProjectReparse(parent.Project) {
+			parentProject = parent.Project
+		}
 	}
 	var errs error
 	for _, p := range paths {
@@ -475,7 +533,14 @@ func (e *Engine) SyncS3SubagentTranscriptsContext(
 		file := parser.DiscoveredFile{
 			Path: p, Agent: parentAgent, Machine: parentMachine,
 		}
-		childID := s3DiscoveredSessionID(file)
+		childID, err := e.s3StoredSessionID(ctx, file, provider)
+		if err != nil {
+			errs = errors.Join(errs, err)
+			continue
+		}
+		if childID == "" {
+			childID = s3DiscoveredSessionIDWithProvider(file, provider)
+		}
 		if childID == "" {
 			continue
 		}

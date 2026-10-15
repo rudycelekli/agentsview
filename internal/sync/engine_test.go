@@ -10102,6 +10102,495 @@ func TestEngine_TryRunExclusiveRejectsBusySyncWithoutRunningWork(t *testing.T) {
 	})
 }
 
+func TestTargetedRefreshLockWait(t *testing.T) {
+	// Mutex acquisition does not durably block in synctest, so ordinary waits use real time.
+	t.Run("ordinary", func(t *testing.T) {
+		fx := newEngineFixture(t)
+		t.Cleanup(fx.engine.Close)
+		path := fx.writeClaudeSession(t, "project", "parent.jsonl", "task")
+		require.NoError(t, fx.engine.SyncPathsContext(t.Context(), []string{path}))
+		fx.engine.syncMu.Lock()
+		started := make(chan struct{})
+		done := make(chan error, 1)
+		go func() {
+			close(started)
+			done <- fx.engine.SyncSingleSessionContext(t.Context(), "parent")
+		}()
+		<-started
+		select {
+		case err := <-done:
+			fx.engine.syncMu.Unlock()
+			require.FailNow(t, "manual refresh returned while the lock was held beyond the usage deadline", "%v", err)
+		case <-time.After(time.Second):
+		}
+		fx.engine.syncMu.Unlock()
+		select {
+		case err := <-done:
+			require.NoError(t, err)
+		case <-time.After(5 * time.Second):
+			require.FailNow(t, "manual refresh did not complete after the lock was released")
+		}
+	})
+	for _, entry := range []struct {
+		name     string
+		run      func(context.Context, *Engine) error
+		outcomes []string
+	}{
+		{"usage", func(ctx context.Context, e *Engine) error { return e.SyncSingleSessionForUsageContext(ctx, "parent") }, []string{"release", "busy", "cancel"}},
+		{"s3", func(ctx context.Context, e *Engine) error {
+			return e.SyncS3SubagentTranscriptsContext(ctx, "parent", parser.AgentClaude, nil)
+		}, []string{"busy"}},
+	} {
+		for _, outcome := range entry.outcomes {
+			t.Run(entry.name+"/"+outcome, func(t *testing.T) {
+				synctest.Test(t, func(t *testing.T) {
+					fx := newEngineFixture(t)
+					engine := fx.engine
+					t.Cleanup(engine.Close)
+					path := fx.writeClaudeSession(t, "project", "parent.jsonl", "task")
+					require.NoError(t, engine.SyncPathsContext(t.Context(), []string{path}))
+					engine.syncMu.Lock()
+					if outcome != "release" {
+						defer engine.syncMu.Unlock()
+					}
+					ctx, cancel := context.WithCancel(t.Context())
+					defer cancel()
+					delay := 20 * time.Millisecond
+					if outcome != "busy" {
+						go func() {
+							time.Sleep(delay)
+							if outcome == "release" {
+								engine.syncMu.Unlock()
+							} else {
+								cancel()
+							}
+						}()
+					}
+					start := time.Now()
+					err := entry.run(ctx, engine)
+					switch outcome {
+					case "release":
+						require.NoError(t, err)
+						assert.GreaterOrEqual(t, time.Since(start), delay)
+						assert.Less(t, time.Since(start), 250*time.Millisecond)
+					case "busy":
+						require.ErrorIs(t, err, ErrSyncInProgress)
+						assert.Equal(t, 250*time.Millisecond, time.Since(start))
+					case "cancel":
+						require.ErrorIs(t, err, context.Canceled)
+						assert.Equal(t, 20*time.Millisecond, time.Since(start))
+					}
+				})
+			})
+		}
+	}
+}
+
+func TestSubagentRefreshDiscovery(t *testing.T) {
+	assertUsage := func(t *testing.T, database *db.DB, rootID string, wantOutput, wantChildren int) {
+		t.Helper()
+		ids := []string{rootID}
+		total := 0
+		for i := 0; i < len(ids); i++ {
+			usage, err := database.GetSessionUsage(t.Context(), ids[i], false)
+			require.NoError(t, err)
+			require.NotNil(t, usage)
+			total += usage.TotalOutputTokens
+			children, err := database.GetChildSessions(t.Context(), ids[i])
+			require.NoError(t, err)
+			for _, child := range children {
+				ids = append(ids, child.ID)
+			}
+		}
+		assert.Equal(t, wantOutput, total)
+		assert.Len(t, ids, wantChildren+1)
+	}
+	for _, agent := range []parser.AgentType{parser.AgentClaude, parser.AgentIcodemate} {
+		t.Run(string(agent), func(t *testing.T) {
+			root := t.TempDir()
+			database := openTestDB(t)
+			engine := NewEngine(t.Context(), database, EngineConfig{AgentDirs: map[parser.AgentType][]string{agent: {root}}, Machine: "local", DeferStartupMaintenance: true})
+			t.Cleanup(engine.Close)
+			const parentRawID = "11111111-1111-4111-8111-111111111111"
+			const timestamp = "2026-01-01T00:00:00Z"
+			content := testjsonl.NewSessionBuilder().AddClaudeUserWithSessionID(timestamp, "task", parentRawID).AddClaudeAssistantUsage(timestamp, "answer", testjsonl.ClaudeAssistantUsage{OutputTokens: 10}).String()
+			parentPath := filepath.Join(root, "project", parentRawID+".jsonl")
+			require.NoError(t, os.MkdirAll(filepath.Dir(parentPath), 0o755))
+			require.NoError(t, os.WriteFile(parentPath, []byte(content), 0o600))
+			require.NoError(t, engine.SyncPathsContext(t.Context(), []string{parentPath}))
+			ids, err := database.ListSessionIDsByFilePath(t.Context(), parentPath, string(agent))
+			require.NoError(t, err)
+			require.Len(t, ids, 1)
+			parentID := ids[0]
+			childDir := filepath.Join(root, "project", parentRawID, "subagents")
+			require.NoError(t, os.MkdirAll(childDir, 0o755))
+			childContent := testjsonl.NewSessionBuilder().AddClaudeUserWithSessionID(timestamp, "child task", parentRawID).AddClaudeAssistantUsage(timestamp, "child answer", testjsonl.ClaudeAssistantUsage{OutputTokens: 42}).String()
+			var childPaths []string
+			for i := range 3 {
+				path := filepath.Join(childDir, fmt.Sprintf("agent-child-%d.jsonl", i))
+				require.NoError(t, os.WriteFile(path, []byte(childContent), 0o600))
+				childPaths = append(childPaths, path)
+			}
+			oldPaths := subagentTranscriptPaths
+			t.Cleanup(func() { subagentTranscriptPaths = oldPaths })
+			enumerations := 0
+			subagentTranscriptPaths = func(discovery *parser.SubagentTranscriptDiscovery, ctx context.Context, agent parser.AgentType, path, rawSessionID string) ([]string, error) {
+				enumerations++
+				return oldPaths(discovery, ctx, agent, path, rawSessionID)
+			}
+			require.False(t, engine.StartupReconciled())
+			require.NoError(t, engine.SyncSessionWithSubagentsContext(t.Context(), parentID))
+			assert.Equal(t, 1, enumerations)
+			assert.False(t, engine.StartupReconciled())
+			assertUsage(t, database, parentID, 136, 3)
+			for _, path := range childPaths {
+				ids, err := database.ListSessionIDsByFilePath(t.Context(), path, string(agent))
+				require.NoError(t, err)
+				require.Len(t, ids, 1)
+				child, err := database.GetSession(t.Context(), ids[0])
+				require.NoError(t, err)
+				require.NotNil(t, child)
+				assert.Equal(t, string(agent), child.Agent)
+				require.NotNil(t, child.ParentSessionID)
+				assert.Equal(t, parentID, *child.ParentSessionID)
+			}
+		})
+	}
+	t.Run("codex", func(t *testing.T) {
+		for _, agent := range []parser.AgentType{parser.AgentCodex} {
+			states := []string{"archived", "new child", "new parent", "missing intermediate", "metadata spawn", "imported grandchild", "restored child", "missing spawner", "trashed child", "excluded child"}
+			for _, state := range states {
+				t.Run(string(agent)+"/"+state, func(t *testing.T) {
+					def, ok := parser.AgentByType(agent)
+					require.True(t, ok)
+					id := func(raw string) string { return def.IDPrefix + raw }
+					root := t.TempDir()
+					database := openTestDB(t)
+					engineConfig := EngineConfig{AgentDirs: map[parser.AgentType][]string{agent: {root}}, Machine: "local", DeferStartupMaintenance: true}
+					engine := NewEngine(t.Context(), database, engineConfig)
+					const parent = "11111111-1111-4111-8111-111111111111"
+					const child = "22222222-2222-4222-8222-222222222222"
+					const other = "33333333-3333-4333-8333-333333333333"
+					const grandchild = "44444444-4444-4444-8444-444444444444"
+					const timestamp = "2026-01-01T00:00:00Z"
+					write := func(id, metadata string, output int, spawned string) string {
+						path := filepath.Join(root, "rollout-2026-01-01T00-00-00-"+id+".jsonl")
+						lines := []string{
+							metadata, testjsonl.CodexTurnContextJSON("gpt-5", timestamp),
+							testjsonl.CodexMsgJSON("user", "task", timestamp),
+							testjsonl.CodexMsgJSON("assistant", "answer", timestamp),
+							testjsonl.CodexTokenCountJSON(timestamp, 20, output, 0),
+						}
+						if spawned != "" {
+							lines = append(lines, testjsonl.CodexFunctionCallWithCallIDJSON("spawn_agent", "spawn", map[string]any{"message": "child task"}, timestamp),
+								testjsonl.CodexFunctionCallOutputJSON("spawn", `{"agent_id":"`+spawned+`"}`, timestamp))
+						}
+						require.NoError(t, os.WriteFile(path, []byte(testjsonl.JoinJSONL(lines...)), 0o600))
+						return path
+					}
+					parentMeta := testjsonl.CodexSessionMetaJSON(parent, "/work/project", "user", timestamp)
+					parentPath := write(parent, parentMeta, 10, "")
+					childMeta := testjsonl.CodexSubagentSessionMetaJSON(child, parent, "/work/project", "user", timestamp)
+					childPath := write(child, childMeta, 1, "")
+					paths := []string{parentPath}
+					if state != "new child" && state != "new parent" && state != "imported grandchild" {
+						paths = append(paths, childPath)
+					}
+					grandchildMeta := testjsonl.CodexSubagentSessionMetaJSON(grandchild, child, "/work/project", "user", timestamp)
+					if state == "missing spawner" {
+						write(child, childMeta, 1, grandchild)
+					}
+					if state == "missing intermediate" || state == "imported grandchild" {
+						paths = append(paths, write(grandchild, grandchildMeta, 2, ""))
+					}
+					if state != "new parent" {
+						require.NoError(t, engine.SyncPathsContext(t.Context(), paths))
+					}
+					engine.Close()
+					if state == "new child" || state == "new parent" || state == "imported grandchild" {
+						absent, err := database.GetSession(t.Context(), id(child))
+						require.NoError(t, err)
+						require.Nil(t, absent)
+						write(parent, parentMeta, 10, child)
+					}
+					wantOutput, wantChildren := 52, 1
+					switch state {
+					case "missing intermediate", "restored child", "missing spawner":
+						require.NoError(t, database.BaselineActiveSessionSourceOwnerships(t.Context(), []db.SessionSourceOwnership{{ID: id(child), Machine: "local", Agent: string(agent), FilePath: childPath}}))
+						marked, err := database.MarkSessionSourceMissing(t.Context(), "local", string(agent), id(child), childPath)
+						require.NoError(t, err)
+						require.True(t, marked)
+						require.NoError(t, os.Remove(childPath))
+						if state == "restored child" {
+							write(child, childMeta, 42, "")
+						} else {
+							write(grandchild, grandchildMeta, 42, "")
+							wantOutput, wantChildren = 53, 2
+						}
+					case "metadata spawn", "imported grandchild":
+						write(child, childMeta, 1, grandchild)
+						write(grandchild, grandchildMeta, 42, "")
+						wantOutput, wantChildren = 53, 2
+					default:
+						write(child, childMeta, 42, "")
+					}
+					if state == "trashed child" || state == "excluded child" {
+						write(parent, parentMeta, 10, child)
+						if state == "trashed child" {
+							require.NoError(t, database.SoftDeleteSession(t.Context(), id(child)))
+						} else {
+							require.NoError(t, database.DeleteSession(t.Context(), id(child)))
+						}
+						wantOutput, wantChildren = 10, 0
+					}
+					write(other, testjsonl.CodexSessionMetaJSON(other, "/work/project", "user", timestamp), 999, "")
+					engine = NewEngine(t.Context(), database, engineConfig)
+					t.Cleanup(engine.Close)
+					require.False(t, engine.StartupReconciled())
+					require.NoError(t, engine.SyncSessionWithSubagentsContext(t.Context(), id(parent)))
+					assertUsage(t, database, id(parent), wantOutput, wantChildren)
+					assert.False(t, engine.StartupReconciled())
+					unrelated, err := database.GetSession(t.Context(), id(other))
+					require.NoError(t, err)
+					assert.Nil(t, unrelated)
+				})
+			}
+		}
+	})
+	t.Run("roo", func(t *testing.T) {
+		root := t.TempDir()
+		database := openTestDB(t)
+		engine := NewEngine(t.Context(), database, EngineConfig{AgentDirs: map[parser.AgentType][]string{parser.AgentRooCode: {root}}, Machine: "local", DeferStartupMaintenance: true})
+		t.Cleanup(engine.Close)
+		write := func(id, history, messages string) string {
+			dir := filepath.Join(root, "tasks", id)
+			require.NoError(t, os.MkdirAll(dir, 0o700))
+			path := filepath.Join(dir, "history_item.json")
+			require.NoError(t, os.WriteFile(path, []byte(history), 0o600))
+			require.NoError(t, os.WriteFile(filepath.Join(dir, "ui_messages.json"), []byte(messages), 0o600))
+			return path
+		}
+		parentPath := write("parent-task", `{"id":"parent-task","ts":1767225600000,"task":"parent task","tokensOut":10,"workspace":"/work/project","childIds":["child-task"]}`, `[
+ {"ts":1767225600000,"type":"say","say":"text","text":"parent task"},
+ {"ts":1767225601000,"type":"ask","ask":"tool","text":"{\"tool\":\"newTask\",\"mode\":\"Code\",\"content\":\"child task\"}"},
+ {"ts":1767225602000,"type":"say","say":"subtask_result","text":"done"}
+ ]`)
+		require.NoError(t, engine.SyncPathsContext(t.Context(), []string{parentPath}))
+		spawned, err := database.SubagentChildSessionIDs(t.Context(), []string{"roocode:parent-task"})
+		require.NoError(t, err)
+		require.Equal(t, []string{"roocode:child-task"}, spawned)
+		write("child-task", `{"id":"child-task","parentTaskId":"parent-task","ts":1767225601000,"task":"child task","tokensOut":42,"workspace":"/work/project"}`, `[{"ts":1767225601000,"type":"say","say":"text","text":"child task"}]`)
+		write("unrelated-task", `{"id":"unrelated-task","ts":1767225601000,"task":"unrelated task","tokensOut":999,"workspace":"/work/project"}`, `[{"ts":1767225601000,"type":"say","say":"text","text":"unrelated task"}]`)
+		absent, err := database.GetSession(t.Context(), "roocode:child-task")
+		require.NoError(t, err)
+		require.Nil(t, absent)
+		require.False(t, engine.StartupReconciled())
+		require.NoError(t, engine.SyncSessionWithSubagentsContext(t.Context(), "roocode:parent-task"))
+		assertUsage(t, database, "roocode:parent-task", 52, 1)
+		assert.False(t, engine.StartupReconciled())
+		unrelated, err := database.GetSession(t.Context(), "roocode:unrelated-task")
+		require.NoError(t, err)
+		assert.Nil(t, unrelated)
+	})
+	t.Run("native layouts", func(t *testing.T) {
+		for _, tt := range []struct {
+			name      string
+			agent     parser.AgentType
+			cursorExt string
+			nested    bool
+		}{
+			{name: "workbuddy", agent: parser.AgentWorkBuddy},
+			{name: "posit", agent: parser.AgentPositAssistant},
+			{name: "pi", agent: parser.AgentPi},
+			{name: "omp", agent: parser.AgentOMP},
+			{name: "cursor nested jsonl", agent: parser.AgentCursor, cursorExt: ".jsonl", nested: true},
+			{name: "cursor flat txt", agent: parser.AgentCursor, cursorExt: ".txt"},
+		} {
+			t.Run(tt.name, func(t *testing.T) {
+				root := t.TempDir()
+				database := openTestDB(t)
+				engine := NewEngine(t.Context(), database, EngineConfig{AgentDirs: map[parser.AgentType][]string{tt.agent: {root}}, Machine: "local", DeferStartupMaintenance: true})
+				t.Cleanup(engine.Close)
+				write := func(path, content string) {
+					require.NoError(t, os.MkdirAll(filepath.Dir(path), 0o700))
+					require.NoError(t, os.WriteFile(path, []byte(content), 0o600))
+				}
+				copyPosit := func(relative string) string {
+					path := filepath.Join(root, "project", relative, "conversation.json")
+					for _, name := range []string{"conversation.json", "lm-messages.jsonl"} {
+						content, err := os.ReadFile(filepath.Join("..", "parser", "testdata", "posit-assistant", "workspaces", "a1b2c3d4", relative, name))
+						require.NoError(t, err)
+						write(filepath.Join(filepath.Dir(path), name), string(content))
+					}
+					return path
+				}
+				workBuddyContent := func(output int) string {
+					return fmt.Sprintf(`{"type":"message","role":"assistant","content":"answer","providerData":{"model":"gpt-5","usage":{"outputTokens":%d}}}`+"\n", output)
+				}
+				piContent := func(id, parent string) string {
+					return fmt.Sprintf(`{"type":"session","version":3,"id":%q,"timestamp":"2026-01-01T00:00:00Z","cwd":"/work/project","parentSession":%q}
+{"type":"message","id":%q,"timestamp":"2026-01-01T00:00:01Z","message":{"role":"user","content":"task"}}
+{"type":"message","id":%q,"timestamp":"2026-01-01T00:00:02Z","message":{"role":"assistant","content":"answer","model":"claude-opus-4-5","usage":{"input":10,"output":42}}}
+`, id, parent, id+"-m1", id+"-m2")
+				}
+				const cursorJSONL = `{"role":"user","message":{"content":"<user_query>task</user_query>"}}
+{"role":"assistant","message":{"content":"answer"}}
+`
+				const cursorTXT = "user:\n<user_query>task</user_query>\n\nassistant:\nanswer\n"
+				parentPath := filepath.Join(root, "project", "2026-01-01T00-00-00-000Z_parent.jsonl")
+				switch tt.agent {
+				case parser.AgentWorkBuddy:
+					parentPath = filepath.Join(root, "project", "11111111-1111-4111-8111-111111111111.jsonl")
+					write(parentPath, workBuddyContent(10))
+				case parser.AgentPositAssistant:
+					parentPath = copyPosit("11111111")
+				case parser.AgentCursor:
+					parentPath = filepath.Join(root, "project", "agent-transcripts", "parent"+tt.cursorExt)
+					if tt.nested {
+						parentPath = filepath.Join(root, "project", "agent-transcripts", "parent", "parent"+tt.cursorExt)
+					}
+					if tt.cursorExt == ".txt" {
+						write(parentPath, cursorTXT)
+					} else {
+						write(parentPath, cursorJSONL)
+					}
+				default:
+					write(parentPath, piContent("parent", ""))
+				}
+				require.NoError(t, engine.SyncPathsContext(t.Context(), []string{parentPath}))
+				ids, err := database.ListSessionIDsByFilePath(t.Context(), parentPath, string(tt.agent))
+				require.NoError(t, err)
+				require.Len(t, ids, 1)
+				parentID := ids[0]
+				spawned, err := database.SubagentChildSessionIDs(t.Context(), []string{parentID})
+				require.NoError(t, err)
+				require.Empty(t, spawned)
+				childPath := filepath.Join(strings.TrimSuffix(parentPath, ".jsonl"), "run-a", "run-0", "session.jsonl")
+				switch tt.agent {
+				case parser.AgentWorkBuddy:
+					childRoot := filepath.Join(strings.TrimSuffix(parentPath, ".jsonl"), "subagents")
+					childPath = filepath.Join(childRoot, "2025.01.01.jsonl")
+					write(childPath, workBuddyContent(42))
+					write(filepath.Join(childRoot, "nested", "ignored.jsonl"), workBuddyContent(100))
+					write(filepath.Join(root, "project", "other.jsonl"), workBuddyContent(100))
+				case parser.AgentPositAssistant:
+					childPath = copyPosit(filepath.Join("11111111", "subagents", "22222222"))
+				case parser.AgentCursor:
+					childPath = filepath.Join(root, "project", "agent-transcripts", "parent", "subagents", "child"+tt.cursorExt)
+					if tt.cursorExt == ".txt" {
+						write(childPath, cursorTXT)
+					} else {
+						write(childPath, cursorJSONL)
+					}
+				default:
+					if tt.agent == parser.AgentOMP {
+						childPath = filepath.Join(strings.TrimSuffix(parentPath, ".jsonl"), "Scout.jsonl")
+					}
+					write(childPath, piContent("child", ""))
+				}
+				absent, err := database.ListSessionIDsByFilePath(t.Context(), childPath, string(tt.agent))
+				require.NoError(t, err)
+				require.Empty(t, absent)
+				require.False(t, engine.StartupReconciled())
+				require.NoError(t, engine.SyncSessionWithSubagentsContext(t.Context(), parentID))
+				wantChildren := 1
+				switch tt.agent {
+				case parser.AgentWorkBuddy:
+					assertUsage(t, database, parentID, 52, wantChildren)
+					unrelated, err := database.GetSession(t.Context(), "workbuddy:other")
+					require.NoError(t, err)
+					assert.Nil(t, unrelated)
+				case parser.AgentPi, parser.AgentOMP:
+					assertUsage(t, database, parentID, 84, wantChildren)
+				default:
+					children, err := database.GetChildSessions(t.Context(), parentID)
+					require.NoError(t, err)
+					assert.Len(t, children, wantChildren)
+				}
+				assert.False(t, engine.StartupReconciled())
+				ids, err = database.ListSessionIDsByFilePath(t.Context(), childPath, string(tt.agent))
+				require.NoError(t, err)
+				require.Len(t, ids, 1)
+				child, err := database.GetSession(t.Context(), ids[0])
+				require.NoError(t, err)
+				require.NotNil(t, child)
+				assert.Equal(t, string(tt.agent), child.Agent)
+				if tt.agent == parser.AgentWorkBuddy {
+					assert.Equal(t, parentID+":subagent:2025.01.01", child.ID)
+				}
+			})
+		}
+	})
+}
+
+func TestSubagentRefreshMarksContentionAfterParentAsIncomplete(t *testing.T) {
+	for _, agent := range []parser.AgentType{parser.AgentClaude, parser.AgentCodex} {
+		t.Run(string(agent), func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) {
+				fx := newEngineFixture(t)
+				t.Cleanup(fx.engine.Close)
+				if agent == parser.AgentClaude {
+					parentPath := fx.writeClaudeSession(t, "proj", "parent.jsonl", "hello")
+					require.NoError(t, fx.engine.SyncPathsContext(t.Context(), []string{parentPath}))
+					fx.appendClaudeMessage(t, parentPath, "changed")
+					childPath := filepath.Join(
+						fx.claudeDir, "proj", "parent", "subagents", "agent-child.jsonl",
+					)
+					require.NoError(t, os.MkdirAll(filepath.Dir(childPath), 0o755))
+					require.NoError(t, os.WriteFile(childPath, []byte(testjsonl.NewSessionBuilder().
+						AddClaudeUser("2024-01-01T00:00:00Z", "child").String()), 0o644))
+				}
+
+				parentID := "parent"
+				if agent == parser.AgentCodex {
+					root := t.TempDir()
+					engine := NewEngine(t.Context(), fx.db, EngineConfig{AgentDirs: map[parser.AgentType][]string{agent: {root}}, Machine: "local"})
+					t.Cleanup(engine.Close)
+					fx.engine = engine
+					const uuid = "11111111-1111-4111-8111-111111111111"
+					const timestamp = "2026-01-01T00:00:00Z"
+					parentID = "codex:" + uuid
+					lines := []string{testjsonl.CodexSessionMetaJSON(uuid, "/work/project", "user", timestamp), testjsonl.CodexMsgJSON("user", "task", timestamp)}
+					for i := range 10 {
+						callID := fmt.Sprintf("spawn-%d", i)
+						childID := fmt.Sprintf("22222222-2222-4222-8222-%012d", i)
+						lines = append(lines, testjsonl.CodexFunctionCallWithCallIDJSON("spawn_agent", callID, map[string]any{"message": "child task"}, timestamp), testjsonl.CodexFunctionCallOutputJSON(callID, `{"agent_id":"`+childID+`"}`, timestamp))
+					}
+					path := filepath.Join(root, "rollout-2026-01-01T00-00-00-"+uuid+".jsonl")
+					require.NoError(t, os.WriteFile(path, []byte(testjsonl.JoinJSONL(lines...)), 0o600))
+				}
+
+				locked := make(chan struct{})
+				release := make(chan struct{})
+				lockDone := make(chan error, 1)
+				var releaseOnce gosync.Once
+				releaseLock := func() { releaseOnce.Do(func() { close(release) }) }
+				t.Cleanup(releaseLock)
+				fx.engine.emitter = emitterFunc(func(scope string) {
+					if scope != "messages" {
+						return
+					}
+					go func() {
+						lockDone <- fx.engine.RunExclusive(func() error {
+							close(locked)
+							<-release
+							return nil
+						})
+					}()
+					<-locked
+				})
+
+				err := fx.engine.SyncSessionWithSubagentsContext(t.Context(), parentID)
+				require.ErrorIs(t, err, ErrSyncInProgress)
+				require.ErrorIs(t, err, ErrSubagentRefreshIncomplete)
+				assert.Contains(t, err.Error(), "usage aggregate may be incomplete")
+				releaseLock()
+				require.NoError(t, <-lockDone)
+			})
+		})
+	}
+}
+
 func TestEngine_ZeroSyncedSuccessfulResyncEmits(t *testing.T) {
 	tests := []struct {
 		name string

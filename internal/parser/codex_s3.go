@@ -77,13 +77,27 @@ func FindCodexS3ParentSessionURIs(
 		CodexSessionUUIDFromFilename("rollout-x-"+parentID+".jsonl") != parentID {
 		return nil
 	}
-	root, ok := codexS3RootURI(configuredRoot, childURI)
+	root, ok := CodexS3SourceRoot(configuredRoot, childURI)
 	if !ok {
 		return nil
 	}
-	objects, err := listS3Objects(root)
+	byKey, err := DiscoverCodexS3SessionURIs(root)
 	if err != nil {
 		return nil
+	}
+	for key := range byKey {
+		if CodexThreadIDFromSessionKey(key) != parentID {
+			delete(byKey, key)
+		}
+	}
+	return slices.Sorted(maps.Values(byKey))
+}
+
+// DiscoverCodexS3SessionURIs indexes canonical rollout objects by session key.
+func DiscoverCodexS3SessionURIs(root string) (map[string]string, error) {
+	objects, err := listS3Objects(root)
+	if err != nil {
+		return nil, err
 	}
 	byKey := make(map[string]string)
 	for _, obj := range objects {
@@ -91,19 +105,19 @@ func FindCodexS3ParentSessionURIs(
 			continue
 		}
 		key := CodexSessionUUIDFromFilename(path.Base(obj.URI))
-		if CodexThreadIDFromSessionKey(key) != parentID {
+		if key == "" {
 			continue
 		}
-		if current, seen := byKey[key]; !seen || codexS3URIPreferred(obj.URI, current) {
+		if current, seen := byKey[key]; !seen || CodexS3URIPreferred(obj.URI, current) {
 			byKey[key] = obj.URI
 		}
 	}
-	return slices.Sorted(maps.Values(byKey))
+	return byKey, nil
 }
 
-// codexS3URIPreferred reports whether a should replace b as the copy of one
+// CodexS3URIPreferred reports whether a should replace b as the copy of one
 // session: live layout before archived, then the lexically smaller URI.
-func codexS3URIPreferred(a, b string) bool {
+func CodexS3URIPreferred(a, b string) bool {
 	aArchived := strings.Contains(a, "/archived_sessions/")
 	bArchived := strings.Contains(b, "/archived_sessions/")
 	if aArchived != bArchived {
@@ -112,7 +126,8 @@ func codexS3URIPreferred(a, b string) bool {
 	return a < b
 }
 
-func codexS3RootURI(configuredRoot, sessionURI string) (string, bool) {
+// CodexS3SourceRoot resolves the configured or inferred rollout listing root.
+func CodexS3SourceRoot(configuredRoot, sessionURI string) (string, bool) {
 	if !strings.HasPrefix(sessionURI, "s3://") {
 		return "", false
 	}

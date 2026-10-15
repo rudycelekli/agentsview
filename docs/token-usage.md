@@ -659,8 +659,9 @@ workflow also:
   second index to keep fresh.
 - **Reads committed archive data** — daily reports can run while the daemon
   imports new source changes. Run `agentsview sync` first when those changes
-  must be included. Session usage and statusline finish any pending startup
-  ingestion before querying, including when they reuse an existing daemon.
+  must be included. See the
+  [source freshness guide](https://agentsview.io/docs/token-usage/#source-freshness)
+  for session usage and statusline behavior.
 
 ## `agentsview usage daily`
 
@@ -1081,12 +1082,18 @@ when it must include new source changes. Full parser rebuilds serve the retained
 archive with a stale warning; scoped upgrades and schema repairs finish before
 the daemon serves requests.
 
-`session usage`, `token-use`, and `usage statusline` complete pending startup
-ingestion before querying. This also applies when a previous daily report
-started the daemon. Once startup ingestion is complete, subsequent queries do
-not repeat a full sync; the daemon's file watcher handles later source changes.
-During a full parser rebuild, these commands skip startup ingestion and read the
-retained archive with a stale warning.
+`session usage` and `token-use` refresh the named session and its subagents.
+These commands skip full startup ingestion. When a stale archive refuses the
+refresh, they show stored usage with a warning to run `agentsview resync`.
+A busy sync or maintenance pass returns stored usage with a warning that the
+aggregate may be incomplete.
+
+A session the archive does not have yet is imported from its source before the
+usage lookup. IDs with no source return "session not found" and exit 2.
+`--own-only` refreshes only the named transcript and excludes subagents.
+Servers below API 12 skip targeted refresh with a warning to restart or upgrade.
+Servers newer than this client require a client upgrade before querying usage.
+Statusline waits for startup sync with a 30-second deadline.
 
 `--no-sync` skips source refresh and starts any new daemon without automatic
 sync. It does not disable sync on an already-running daemon. `--offline` reads

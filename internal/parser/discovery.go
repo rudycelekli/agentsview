@@ -653,22 +653,12 @@ func projectJSONLSessionFiles(
 // returns object URIs. Returns nil for a non-Claude path, a path with no such
 // directory, or an empty path.
 func ClaudeSubagentTranscriptPaths(sessionPath string) []string {
-	if sessionPath == "" || !strings.HasSuffix(sessionPath, ".jsonl") {
+	subagentsDir := ClaudeSubagentTranscriptRoot(sessionPath)
+	if subagentsDir == "" {
 		return nil
 	}
 	if strings.HasPrefix(sessionPath, "s3://") {
 		return claudeS3SubagentTranscriptPaths(sessionPath)
-	}
-	stem := strings.TrimSuffix(filepath.Base(sessionPath), ".jsonl")
-	if stem == "" {
-		return nil
-	}
-	subagentsDir := filepath.Join(filepath.Dir(sessionPath), stem, "subagents")
-	if strings.HasPrefix(stem, "agent-") {
-		subagentsDir = claudeEnclosingSubagentsDir(sessionPath)
-		if subagentsDir == "" {
-			return nil
-		}
 	}
 	cleanSessionPath := filepath.Clean(sessionPath)
 	var paths []string
@@ -692,6 +682,35 @@ func ClaudeSubagentTranscriptPaths(sessionPath string) []string {
 	)
 	sort.Strings(paths)
 	return paths
+}
+
+// ClaudeSubagentTranscriptRoot returns the discovery directory or S3 prefix for a transcript.
+func ClaudeSubagentTranscriptRoot(sessionPath string) string {
+	if sessionPath == "" || !strings.HasSuffix(sessionPath, ".jsonl") {
+		return ""
+	}
+	if strings.HasPrefix(sessionPath, "s3://") {
+		stem := strings.TrimSuffix(pathBase(sessionPath), ".jsonl")
+		if stem == "" {
+			return ""
+		}
+		if strings.HasPrefix(stem, "agent-") {
+			before, _, ok := strings.CutLast(sessionPath, "/subagents/")
+			if !ok {
+				return ""
+			}
+			return before + "/subagents"
+		}
+		return strings.TrimSuffix(sessionPath, ".jsonl") + "/subagents"
+	}
+	stem := strings.TrimSuffix(filepath.Base(sessionPath), ".jsonl")
+	if stem == "" {
+		return ""
+	}
+	if strings.HasPrefix(stem, "agent-") {
+		return claudeEnclosingSubagentsDir(sessionPath)
+	}
+	return filepath.Join(filepath.Dir(sessionPath), stem, "subagents")
 }
 
 func claudeEnclosingSubagentsDir(sessionPath string) string {

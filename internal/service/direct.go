@@ -577,50 +577,81 @@ func (b *directBackend) Sync(
 	if in.Subagents && in.ID == "" {
 		return nil, errors.New("sync: subagents requires id")
 	}
+	if in.UsageRefresh && in.ID == "" {
+		return nil, errors.New("sync: usage_refresh requires id")
+	}
+	if in.UsageRefresh {
+		id, err := b.resolveUsageRefreshID(ctx, in.ID)
+		if err != nil {
+			return nil, err
+		}
+		in.ID = id
+	}
+	path := in.Path
 	if in.Subagents {
+		if in.UsageRefresh && isVibeSessionID(in.ID) {
+			storedPath := b.local.GetSessionFilePath(ctx, in.ID)
+			if storedPath == "" {
+				storedPath = b.engine.FindSourceFile(ctx, in.ID)
+			}
+			path = parser.ResolveSourceFilePath(storedPath)
+		}
 		if err := b.engine.SyncSessionWithSubagentsContext(
 			ctx, in.ID,
 		); err != nil {
 			return nil, err
 		}
-		return b.Get(ctx, in.ID)
+		if !in.UsageRefresh {
+			return b.Get(ctx, in.ID)
+		}
 	}
 
-	path := in.Path
-	if path == "" {
+	if !in.Subagents && path == "" {
 		storedPath := b.local.GetSessionFilePath(ctx, in.ID)
+		if storedPath == "" && in.UsageRefresh {
+			storedPath = b.engine.FindSourceFile(ctx, in.ID)
+		}
 		if storedPath == "" {
 			return nil, fmt.Errorf(
 				"sync: no file_path recorded for session %q", in.ID,
 			)
 		}
-		// Visual Studio Copilot stores file_path as a
-		// <traceFile>#<conversationID> virtual key. Stripping it to the
-		// physical trace and syncing the path would reparse every conversation
-		// in that trace, lose the requested conversation's scope, and do
-		// nothing if the representative trace was deleted while the
-		// conversation lives on in a sibling. The single-session path keeps the
-		// conversation scope and follows it across sibling trace files.
-		if _, _, ok := parser.SplitVisualStudioCopilotVirtualPath(storedPath); ok {
-			if err := b.engine.SyncSingleSessionContext(
-				ctx, in.ID,
-			); err != nil {
+		if in.UsageRefresh {
+			if err := b.engine.SyncSingleSessionForUsageContext(ctx, in.ID); err != nil {
 				return nil, err
 			}
-			return b.Get(ctx, in.ID)
-		}
-		if _, _, ok := parser.SplitWindsurfVirtualPath(storedPath); ok {
-			if err := b.engine.SyncSingleSessionContext(
-				ctx, in.ID,
-			); err != nil {
-				return nil, err
+			path = parser.ResolveSourceFilePath(storedPath)
+		} else {
+			// Visual Studio Copilot stores file_path as a
+			// <traceFile>#<conversationID> virtual key. Stripping it to the
+			// physical trace and syncing the path would reparse every conversation
+			// in that trace, lose the requested conversation's scope, and do
+			// nothing if the representative trace was deleted while the
+			// conversation lives on in a sibling. The single-session path keeps the
+			// conversation scope and follows it across sibling trace files.
+			if _, _, ok := parser.SplitVisualStudioCopilotVirtualPath(storedPath); ok {
+				if err := b.engine.SyncSingleSessionContext(
+					ctx, in.ID,
+				); err != nil {
+					return nil, err
+				}
+				return b.Get(ctx, in.ID)
 			}
-			return b.Get(ctx, in.ID)
+			if _, _, ok := parser.SplitWindsurfVirtualPath(storedPath); ok {
+				if err := b.engine.SyncSingleSessionContext(
+					ctx, in.ID,
+				); err != nil {
+					return nil, err
+				}
+				return b.Get(ctx, in.ID)
+			}
+			path = parser.ResolveSourceFilePath(storedPath)
 		}
-		path = parser.ResolveSourceFilePath(storedPath)
 	}
 
-	b.engine.SyncPaths([]string{path})
+	if !in.UsageRefresh {
+		b.engine.SyncPaths([]string{path})
+	}
 
 	id := in.ID
 	if id == "" {
@@ -664,6 +695,36 @@ func (b *directBackend) Sync(
 
 func syncSessionNotFoundError(id string) error {
 	return fmt.Errorf("sync: session %q was not found after sync", id)
+}
+
+// resolveUsageRefreshID identifies unarchived bare IDs using the daemon's
+// configured providers, before a targeted import assigns an agent namespace.
+func (b *directBackend) resolveUsageRefreshID(ctx context.Context, id string) (string, error) {
+	host, _ := parser.StripHostPrefix(id)
+	def, known := parser.AgentByPrefix(id)
+	if host != "" || known && def.IDPrefix != "" {
+		return id, nil
+	}
+	detail, err := b.Get(ctx, id)
+	if err != nil || detail != nil {
+		return id, err
+	}
+	if b.engine.FindSourceFile(ctx, id) != "" {
+		return id, nil
+	}
+	for _, def := range parser.Registry {
+		if err := ctx.Err(); err != nil {
+			return "", err
+		}
+		if def.IDPrefix == "" {
+			continue
+		}
+		candidate := def.IDPrefix + id
+		if b.engine.FindSourceFile(ctx, candidate) != "" {
+			return candidate, nil
+		}
+	}
+	return id, ctx.Err()
 }
 
 func isVibeSessionID(id string) bool {

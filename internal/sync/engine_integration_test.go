@@ -746,6 +746,88 @@ func TestSyncEngineOpenCodeFamilySQLiteDropsUnchangedContainerSessions(
 	}
 }
 
+func TestSyncSessionWithSubagentsDiscoversOpenCodeFamilyChildrenBeforeStartupSync(t *testing.T) {
+	for _, tt := range openCodeFamilySQLiteCases() {
+		t.Run(tt.name, func(t *testing.T) {
+			root := t.TempDir()
+			database := dbtest.OpenTestDB(t)
+			engine := newOpenCodeFamilySQLiteTestEngine(t, tt.agent, root, database)
+			t.Cleanup(engine.Close)
+			oc := createOpenCodeLikeDB(t, filepath.Join(root, tt.dbName), tt.name)
+			oc.addProject(t, "proj", "/workspace/project-a")
+			seedOpenCodeSQLiteTextSession(t, oc, "proj", "parent", 1779012000000, 1779012030000, "parent prompt", "parent answer")
+			require.NoError(t, engine.SyncSingleSession(tt.prefix+"parent"))
+
+			for _, s := range []struct{ id, parent string }{
+				{"child", "parent"},
+				{"grandchild", "child"},
+				{"unrelated", ""},
+			} {
+				seedOpenCodeSQLiteTextSession(t, oc, "proj", s.id, 1779012100000, 1779012130000, s.id+" prompt", s.id+" answer")
+				if s.parent != "" {
+					oc.mustExec(t, "set parent", "UPDATE session SET parent_id = ? WHERE id = ?", s.parent, s.id)
+				}
+			}
+
+			require.False(t, engine.StartupReconciled())
+			require.NoError(t, engine.SyncSessionWithSubagentsContext(t.Context(), tt.prefix+"parent"))
+			assert.False(t, engine.StartupReconciled())
+			children, err := database.GetChildSessions(t.Context(), tt.prefix+"parent")
+			require.NoError(t, err)
+			require.Len(t, children, 1)
+			assert.Equal(t, tt.prefix+"child", children[0].ID)
+			grandchildren, err := database.GetChildSessions(t.Context(), children[0].ID)
+			require.NoError(t, err)
+			require.Len(t, grandchildren, 1)
+			assert.Equal(t, tt.prefix+"grandchild", grandchildren[0].ID)
+			unrelated, err := database.GetSession(t.Context(), tt.prefix+"unrelated")
+			require.NoError(t, err)
+			assert.Nil(t, unrelated)
+		})
+	}
+}
+
+func TestSyncSessionWithSubagentsDiscoversOpenCodeStorageChildrenBeforeStartupSync(t *testing.T) {
+	for _, tt := range openCodeFamilySQLiteCases() {
+		t.Run(tt.name, func(t *testing.T) {
+			root := t.TempDir()
+			database := dbtest.OpenTestDB(t)
+			engine := newOpenCodeFamilySQLiteTestEngine(t, tt.agent, root, database)
+			t.Cleanup(engine.Close)
+			storage := createOpenCodeStorageFixture(t, root)
+			if tt.agent == parser.AgentMiMoCode || tt.agent == parser.AgentIcodemate {
+				storage = createMiMoCodeStorageFixture(t, root)
+			}
+			addSession := func(id, parent string) {
+				storage.writeJSON(t, filepath.Join(root, "storage", storage.sessionSubdir, "proj", id+".json"), map[string]any{
+					"id": id, "parentID": parent, "projectID": "proj", "directory": "/workspace/project-a",
+					"title": id, "time": map[string]any{"created": 1704067200000, "updated": 1704067205000},
+				})
+				storage.addMessage(t, id, id+"-msg", "assistant", 1704067201000, nil)
+				storage.addTextPart(t, id, id+"-msg", id+"-part", id+" reply", 1704067201000)
+			}
+			addSession("parent", "")
+			require.NoError(t, engine.SyncSingleSession(tt.prefix+"parent"))
+			addSession("child", "parent")
+			addSession("grandchild", "child")
+			addSession("unrelated", "")
+
+			require.NoError(t, engine.SyncSessionWithSubagentsContext(t.Context(), tt.prefix+"parent"))
+			children, err := database.GetChildSessions(t.Context(), tt.prefix+"parent")
+			require.NoError(t, err)
+			require.Len(t, children, 1)
+			assert.Equal(t, tt.prefix+"child", children[0].ID)
+			grandchildren, err := database.GetChildSessions(t.Context(), children[0].ID)
+			require.NoError(t, err)
+			require.Len(t, grandchildren, 1)
+			assert.Equal(t, tt.prefix+"grandchild", grandchildren[0].ID)
+			unrelated, err := database.GetSession(t.Context(), tt.prefix+"unrelated")
+			require.NoError(t, err)
+			assert.Nil(t, unrelated)
+		})
+	}
+}
+
 // TestSyncEngineOpenCodeSQLiteWALOnlyChangeStillReemits pins the gate's WAL
 // awareness: OpenCode runs its database in WAL mode, where a committed write
 // only appends frames to opencode.db-wal and leaves the main file's size,
