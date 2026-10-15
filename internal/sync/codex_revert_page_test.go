@@ -777,8 +777,10 @@ func TestCodexLegacyHeaderPageUpgradeLinksAndTitlesThePage(t *testing.T) {
 	pagePath := writeCodexRollout(t, root, "25", "rollout-2026-09-25T10-00-00-"+paginationThread+"_"+rollout+".jsonl",
 		testjsonl.JoinJSONL(
 			testjsonl.CodexSessionMetaWithFieldsJSON(rollout, "/work/project", "codex_cli_rs", "2026-09-25T10:00:00Z",
-				map[string]any{"session_id": paginationThread, "history_mode": "paginated",
-					"history_base": map[string]any{"thread_id": paginationThread}}),
+				map[string]any{
+					"session_id": paginationThread, "history_mode": "paginated",
+					"history_base": map[string]any{"thread_id": paginationThread},
+				}),
 			codexUserEntryJSON("2026-09-25T10:00:01Z", "page prompt"),
 		))
 	indexPath := filepath.Join(home, parser.CodexSessionIndexFilename)

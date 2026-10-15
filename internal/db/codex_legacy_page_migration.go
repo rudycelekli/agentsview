@@ -24,9 +24,8 @@ const codexLegacyPageVersion = 134
 // archives below codexLegacyPageVersion. Renaming in place, as the Devin source
 // uuid rewrite does, means curation, trash, exclusions, labels and
 // relationships need no translation later: every consumer sees one identity.
-// A page whose target id is already in use anywhere is left for the reparse to
-// settle; a collision that slips through fails the open rather than replacing
-// a row.
+// A page whose target id is already in use anywhere is skipped and left for
+// the reparse to settle, so the rename never replaces a row.
 //
 // Every column that holds a session id is found from the schema: columns named
 // session_id or *_session_id, and every foreign key into sessions. Foreign
@@ -34,10 +33,10 @@ const codexLegacyPageVersion = 134
 //
 // The old id is journaled as a deletion, as trg_sessions_deletion_journal_delete
 // would, and the new row's transcript revision advances, so mirrors drop the
-// old row and publish the new one. Sessions that referenced a renamed page
-// advance local_modified_at so an incremental mirror re-sends them, and an
-// initialized conversation export gets tombstones for the old id and fresh
-// revisions for the moved messages.
+// old row and publish the new one. The scoped reparse does not do this on its
+// own: sessions that referenced a renamed page advance local_modified_at so an
+// incremental mirror re-sends them, and an initialized conversation export gets
+// tombstones for the old id and fresh revisions for the moved messages.
 func renameLegacyCodexPagesLocked(ctx context.Context, w *writerHandle) error {
 	var version int
 	if err := w.QueryRowContext(
@@ -64,24 +63,8 @@ func renameLegacyCodexPagesLocked(ctx context.Context, w *writerHandle) error {
 		`SELECT id, file_path FROM excluded_sessions
 		 WHERE file_path IS NOT NULL AND file_path != ''`,
 	} {
-		rows, err := tx.QueryContext(ctx, q)
-		if err != nil {
-			return fmt.Errorf("finding legacy codex pages: %w", err)
-		}
-		for rows.Next() {
-			var id, path string
-			if err := rows.Scan(&id, &path); err != nil {
-				rows.Close()
-				return fmt.Errorf("scanning legacy codex page: %w", err)
-			}
-			if target, ok := legacyCodexPageID(id, path); ok {
-				renames[id] = target
-			}
-		}
-		err = rows.Err()
-		rows.Close()
-		if err != nil {
-			return fmt.Errorf("listing legacy codex pages: %w", err)
+		if err := collectLegacyCodexPages(ctx, tx, q, renames); err != nil {
+			return err
 		}
 	}
 	if len(renames) == 0 {
@@ -119,48 +102,38 @@ func renameLegacyCodexPagesLocked(ctx context.Context, w *writerHandle) error {
 		}
 	}
 
-	// Journal the old ids as deletions before the rows move.
-	var journaled []string
-	jrows, err := tx.QueryContext(ctx, `SELECT s.id, s.project FROM sessions s
-		JOIN _codex_page_renames r ON r.old_id = s.id`)
+	pages, err := journaledLegacyPages(ctx, tx)
 	if err != nil {
-		return fmt.Errorf("finding journaled legacy codex pages: %w", err)
+		return err
 	}
-	var projects []string
-	for jrows.Next() {
-		var id, project string
-		if err := jrows.Scan(&id, &project); err != nil {
-			jrows.Close()
-			return fmt.Errorf("scanning journaled legacy codex page: %w", err)
-		}
-		journaled = append(journaled, id)
-		projects = append(projects, project)
-	}
-	err = jrows.Err()
-	jrows.Close()
-	if err != nil {
-		return fmt.Errorf("listing journaled legacy codex pages: %w", err)
-	}
-	for i, id := range journaled {
-		if err := journalSessionDeletionTx(ctx, tx, id, projects[i]); err != nil {
+	for _, p := range pages {
+		if err := journalSessionDeletionTx(ctx, tx, p.id, p.project); err != nil {
 			return fmt.Errorf("journaling legacy codex page: %w", err)
 		}
 	}
 
-	// Rows that merely reference a renamed page keep their own identity, but
-	// the value they mirror changes. Find them before the rewrite.
-	referrers := map[string]bool{}
+	// Sessions that merely reference a renamed page keep their identity, but
+	// the id they mirror changes. Advancing local_modified_at, which the
+	// sync_marker trigger turns into an incremental mirror candidate, has to
+	// happen before the rewrite finds them.
 	for _, c := range cols {
-		owners, err := referencingSessionsLocked(ctx, tx, c[0], c[1])
-		if err != nil {
-			return err
+		owner := "session_id"
+		if c[0] == "sessions" {
+			owner = "id"
 		}
-		for _, id := range owners {
-			if _, renamed := renames[id]; !renamed {
-				referrers[id] = true
-			}
+		if c[1] == "session_id" || !columnExists(ctx, tx, c[0], owner) {
+			continue
+		}
+		if _, err := tx.ExecContext(ctx, fmt.Sprintf(`UPDATE sessions
+			SET local_modified_at = strftime('%%Y-%%m-%%dT%%H:%%M:%%fZ','now')
+			WHERE id IN (SELECT %[3]s FROM %[1]s
+			             WHERE %[2]s IN (SELECT old_id FROM _codex_page_renames))
+			  AND id NOT IN (SELECT old_id FROM _codex_page_renames)`,
+			quoteIdent(c[0]), quoteIdent(c[1]), quoteIdent(owner))); err != nil {
+			return fmt.Errorf("touching sessions referencing %s.%s: %w", c[0], c[1], err)
 		}
 	}
+
 	if _, err := tx.ExecContext(ctx, `UPDATE sessions
 		SET id = (SELECT new_id FROM _codex_page_renames WHERE old_id = sessions.id)
 		WHERE id IN (SELECT old_id FROM _codex_page_renames)`); err != nil {
@@ -175,37 +148,16 @@ func renameLegacyCodexPagesLocked(ctx context.Context, w *writerHandle) error {
 			return fmt.Errorf("renaming %s.%s: %w", c[0], c[1], err)
 		}
 	}
-	for _, id := range journaled {
-		var newID string
-		if err := tx.QueryRowContext(ctx,
-			`SELECT new_id FROM _codex_page_renames WHERE old_id = ?`, id,
-		).Scan(&newID); err != nil {
-			return fmt.Errorf("reading renamed codex page: %w", err)
-		}
-		if err := bumpTranscriptRevision(tx, newID, true); err != nil {
+	active, err := conversationExportActiveTx(contextTransaction{ctx: ctx, tx: tx})
+	if err != nil {
+		return err
+	}
+	for _, p := range pages {
+		if err := bumpTranscriptRevision(tx, p.newID, true); err != nil {
 			return err
 		}
-	}
-	// Sessions that referenced a renamed page advance local_modified_at, which
-	// the sync_marker trigger turns into an incremental mirror candidate.
-	for id := range referrers {
-		if _, err := tx.ExecContext(ctx, `UPDATE sessions
-			SET local_modified_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
-			WHERE id = ?`, id); err != nil {
-			return fmt.Errorf("touching session referencing a renamed codex page: %w", err)
-		}
-	}
-	if active, err := conversationExportActiveTx(contextTransaction{ctx: ctx, tx: tx}); err != nil {
-		return err
-	} else if active {
-		for _, id := range journaled {
-			var newID string
-			if err := tx.QueryRowContext(ctx,
-				`SELECT new_id FROM _codex_page_renames WHERE old_id = ?`, id,
-			).Scan(&newID); err != nil {
-				return fmt.Errorf("reading renamed codex page: %w", err)
-			}
-			if err := republishConversationRenameTx(ctx, tx, id, newID); err != nil {
+		if active {
+			if err := republishConversationRenameTx(ctx, tx, p.id, p.newID); err != nil {
 				return err
 			}
 		}
@@ -214,6 +166,61 @@ func renameLegacyCodexPagesLocked(ctx context.Context, w *writerHandle) error {
 		return fmt.Errorf("committing legacy codex page rename: %w", err)
 	}
 	return nil
+}
+
+// journaledLegacyPage is a stored session about to move to newID.
+type journaledLegacyPage struct {
+	id, project, newID string
+}
+
+func journaledLegacyPages(
+	ctx context.Context, tx *sql.Tx,
+) ([]journaledLegacyPage, error) {
+	rows, err := tx.QueryContext(ctx, `SELECT s.id, s.project, r.new_id
+		FROM sessions s JOIN _codex_page_renames r ON r.old_id = s.id`)
+	if err != nil {
+		return nil, fmt.Errorf("finding journaled legacy codex pages: %w", err)
+	}
+	defer rows.Close()
+	var pages []journaledLegacyPage
+	for rows.Next() {
+		var p journaledLegacyPage
+		if err := rows.Scan(&p.id, &p.project, &p.newID); err != nil {
+			return nil, fmt.Errorf("scanning journaled legacy codex page: %w", err)
+		}
+		pages = append(pages, p)
+	}
+	return pages, rows.Err()
+}
+
+// collectLegacyCodexPages adds to renames every (id, file_path) row of query
+// whose id is a legacy page.
+func collectLegacyCodexPages(
+	ctx context.Context, tx *sql.Tx, query string, renames map[string]string,
+) error {
+	rows, err := tx.QueryContext(ctx, query)
+	if err != nil {
+		return fmt.Errorf("finding legacy codex pages: %w", err)
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var id, path string
+		if err := rows.Scan(&id, &path); err != nil {
+			return fmt.Errorf("scanning legacy codex page: %w", err)
+		}
+		if target, ok := legacyCodexPageID(id, path); ok {
+			renames[id] = target
+		}
+	}
+	return rows.Err()
+}
+
+func columnExists(ctx context.Context, tx *sql.Tx, table, col string) bool {
+	var has bool
+	err := tx.QueryRowContext(ctx, `SELECT EXISTS (
+		SELECT 1 FROM pragma_table_info(?) WHERE name = ?)`, table, col,
+	).Scan(&has)
+	return err == nil && has
 }
 
 // legacyCodexPageID returns the canonical id for a stored Codex id whose raw
@@ -272,49 +279,6 @@ func sessionIDColumnsLocked(
 	return append(cols, [2]string{"excluded_sessions", "id"}), rows.Err()
 }
 
-// referencingSessionsLocked returns the sessions whose mirrored data holds a
-// renamed id in table.col: the row's own id for the sessions table, otherwise
-// the row's session_id. Columns that are themselves a session_id belong to the
-// renamed page, whose revision advances anyway.
-func referencingSessionsLocked(
-	ctx context.Context, tx *sql.Tx, table, col string,
-) ([]string, error) {
-	var owner string
-	switch {
-	case table == "sessions":
-		owner = "id"
-	case col == "session_id":
-		return nil, nil
-	default:
-		var has bool
-		if err := tx.QueryRowContext(ctx, `SELECT EXISTS (
-			SELECT 1 FROM pragma_table_info(?) WHERE name = 'session_id')`, table,
-		).Scan(&has); err != nil {
-			return nil, fmt.Errorf("probing %s owner column: %w", table, err)
-		}
-		if !has {
-			return nil, nil
-		}
-		owner = "session_id"
-	}
-	rows, err := tx.QueryContext(ctx, fmt.Sprintf(
-		`SELECT DISTINCT %[3]s FROM %[1]s WHERE %[2]s IN (SELECT old_id FROM _codex_page_renames)`,
-		quoteIdent(table), quoteIdent(col), quoteIdent(owner)))
-	if err != nil {
-		return nil, fmt.Errorf("finding sessions referencing %s.%s: %w", table, col, err)
-	}
-	defer rows.Close()
-	var ids []string
-	for rows.Next() {
-		var id string
-		if err := rows.Scan(&id); err != nil {
-			return nil, fmt.Errorf("scanning referencing session: %w", err)
-		}
-		ids = append(ids, id)
-	}
-	return ids, rows.Err()
-}
-
 // republishConversationRenameTx tells conversation export consumers that
 // oldID is gone and newID carries its messages. The rewrite of session_id
 // alone is not a publishable change, so a client holding a checkpoint would
@@ -351,22 +315,7 @@ func republishConversationRenameTx(
 		oldID, rev); err != nil {
 		return fmt.Errorf("tombstoning renamed conversation session: %w", err)
 	}
-	rows, err := tx.QueryContext(ctx, `SELECT message_id FROM conversation_messages
-		WHERE session_id = ? AND removed = 0 ORDER BY ordinal`, newID)
-	if err != nil {
-		return fmt.Errorf("listing renamed conversation messages: %w", err)
-	}
-	var ids []string
-	for rows.Next() {
-		var id string
-		if err := rows.Scan(&id); err != nil {
-			rows.Close()
-			return err
-		}
-		ids = append(ids, id)
-	}
-	err = rows.Err()
-	rows.Close()
+	ids, err := liveConversationMessageIDs(ctx, tx, newID)
 	if err != nil {
 		return err
 	}
@@ -385,6 +334,26 @@ func republishConversationRenameTx(
 	_, err = tx.ExecContext(ctx, `UPDATE conversation_session_changes SET revision = ?
 		WHERE session_id = ?`, rev, newID)
 	return err
+}
+
+func liveConversationMessageIDs(
+	ctx context.Context, tx *sql.Tx, sessionID string,
+) ([]string, error) {
+	rows, err := tx.QueryContext(ctx, `SELECT message_id FROM conversation_messages
+		WHERE session_id = ? AND removed = 0 ORDER BY ordinal`, sessionID)
+	if err != nil {
+		return nil, fmt.Errorf("listing renamed conversation messages: %w", err)
+	}
+	defer rows.Close()
+	var ids []string
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		ids = append(ids, id)
+	}
+	return ids, rows.Err()
 }
 
 func quoteIdent(name string) string {

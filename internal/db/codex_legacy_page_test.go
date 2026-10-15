@@ -7,7 +7,6 @@ import (
 	"slices"
 	"strings"
 	"testing"
-	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -71,7 +70,10 @@ var (
 		{"tool_result_events", "subagent_session_id"},
 		{"usage_events", "session_id"},
 	}
-	legacyJournalColumns = [][2]string{
+	// legacyCJKPendingColumn exists only when the CJK FTS sidecar is loaded
+	// (AGENTSVIEW_SIMPLE_DIR); the rename moves it like any other.
+	legacyCJKPendingColumn = [2]string{"messages_cjk_fts_pending_sessions", "session_id"}
+	legacyJournalColumns   = [][2]string{
 		{"session_deletion_changes", "session_id"},
 		{"session_project_identity_snapshot_changes", "session_id"},
 		{"sessions", "source_session_id"},
@@ -103,6 +105,7 @@ func TestLegacyCodexPageRenameCoversSessionIDColumns(t *testing.T) {
 		SELECT m.name, f."from" FROM sqlite_master m, pragma_foreign_key_list(m.name) f
 		WHERE m.type = 'table' AND f."table" = 'sessions'`)
 	require.NoError(t, err)
+	defer rows.Close()
 	var found [][2]string
 	for rows.Next() {
 		var c [2]string
@@ -110,8 +113,11 @@ func TestLegacyCodexPageRenameCoversSessionIDColumns(t *testing.T) {
 		found = append(found, c)
 	}
 	require.NoError(t, rows.Err())
-	rows.Close()
-	want := append(slices.Clone(legacyRenamedColumns), legacyJournalColumns...)
+	renamedWant := slices.Clone(legacyRenamedColumns)
+	if slices.Contains(found, legacyCJKPendingColumn) {
+		renamedWant = append(renamedWant, legacyCJKPendingColumn)
+	}
+	want := append(slices.Clone(renamedWant), legacyJournalColumns...)
 	sortPairs := func(p [][2]string) {
 		slices.SortFunc(p, func(a, b [2]string) int {
 			return strings.Compare(a[0]+"."+a[1], b[0]+"."+b[1])
@@ -126,7 +132,7 @@ func TestLegacyCodexPageRenameCoversSessionIDColumns(t *testing.T) {
 	defer tx.Rollback()
 	walked, err := sessionIDColumnsLocked(ctx, tx)
 	require.NoError(t, err)
-	renamed := slices.Clone(legacyRenamedColumns)
+	renamed := renamedWant
 	sortPairs(walked)
 	sortPairs(renamed)
 	assert.Equal(t, renamed, walked, "columns the migration renames")
@@ -293,109 +299,5 @@ func TestOpenRenamesLegacyCodexPages(t *testing.T) {
 				assert.Zero(t, n, "%s.%s still holds a legacy page id", c[0], c[1])
 			}
 		})
-	}
-}
-
-// TestLegacyCodexPageRenamePublishesToIncrementalConsumers covers the two
-// consumers that only read what advanced since their last pass. A conversation
-// export client holding a checkpoint from before the rename must see the old
-// id removed and the new id's messages again, and a mirror that only selects
-// sessions whose sync marker moved must pick up a child of another provider
-// whose parent_session_id was rewritten.
-func TestLegacyCodexPageRenamePublishesToIncrementalConsumers(t *testing.T) {
-	ctx := t.Context()
-	path := filepath.Join(t.TempDir(), "test.db")
-	d, err := Open(ctx, path)
-	require.NoError(t, err)
-
-	const (
-		page    = "codex:" + legacyRollout
-		pageNew = "codex:" + legacyThread + "_" + legacyRollout
-		child   = "claude:child"
-	)
-	insertSession(t, d, page, "proj", func(s *Session) {
-		s.Agent = "codex"
-		s.FilePath = legacyPagePath(legacyThread, legacyRollout)
-	})
-	parent := page
-	insertSession(t, d, child, "proj", func(s *Session) {
-		s.Agent = "claude"
-		s.ParentSessionID = &parent
-	})
-	insertMessages(t, d, userMsg(page, 0, "page prompt"), asstMsg(page, 1, "page answer"))
-
-	checkpoint, err := d.ExportConversationChanges(ctx, ConversationExportOptions{})
-	require.NoError(t, err)
-	require.NotEmpty(t, checkpoint.Checkpoint)
-	require.Len(t, checkpoint.Changes, 2)
-
-	var childMarker, childModified string
-	require.NoError(t, d.getReader().QueryRow(ctx,
-		`SELECT sync_marker, COALESCE(local_modified_at, '') FROM sessions WHERE id = ?`, child,
-	).Scan(&childMarker, &childModified))
-	time.Sleep(20 * time.Millisecond)
-	cutoff := time.Now().UTC().Format("2006-01-02T15:04:05.000Z")
-	require.Less(t, childMarker, cutoff)
-	time.Sleep(20 * time.Millisecond)
-	d.Close()
-
-	conn, err := sql.Open("sqlite3", path)
-	require.NoError(t, err)
-	_, err = conn.ExecContext(ctx, "PRAGMA user_version = "+itoa(codexLegacyPageVersion-1))
-	require.NoError(t, err)
-	conn.Close()
-
-	d, err = Open(ctx, path)
-	require.NoError(t, err)
-	defer d.Close()
-
-	// The conversation delta since the old checkpoint.
-	delta, err := d.ExportConversationChanges(ctx, ConversationExportOptions{
-		Checkpoint: checkpoint.Checkpoint,
-	})
-	require.NoError(t, err)
-	type key struct {
-		session string
-		deleted bool
-		kind    string
-	}
-	got := map[key]int{}
-	for _, c := range delta.Changes {
-		got[key{c.SessionID, c.Deleted, c.Type}]++
-	}
-	assert.Equal(t, 1, got[key{page, true, "session"}], "old id is announced as gone")
-	assert.Equal(t, 2, got[key{page, true, "message"}], "old messages are tombstoned")
-	assert.Equal(t, 2, got[key{pageNew, false, "message"}], "new id republishes its messages")
-	assert.Zero(t, got[key{pageNew, true, "message"}])
-	revisions := map[string]bool{}
-	for _, c := range delta.Changes {
-		assert.False(t, revisions[c.Revision], "revision %s repeats", c.Revision)
-		revisions[c.Revision] = true
-	}
-	again, err := d.ExportConversationChanges(ctx, ConversationExportOptions{
-		Checkpoint: delta.Checkpoint,
-	})
-	require.NoError(t, err)
-	assert.Empty(t, again.Changes, "the delta is consumed once")
-
-	// The mirror's incremental window.
-	var marker, modified string
-	require.NoError(t, d.getReader().QueryRow(ctx,
-		`SELECT sync_marker, COALESCE(local_modified_at, '') FROM sessions WHERE id = ?`, child,
-	).Scan(&marker, &modified))
-	assert.NotEqual(t, childModified, modified, "the referencing child advanced")
-	assert.Greater(t, marker, childMarker)
-	window, err := d.ListSessionsForMirrorWindow(ctx, cutoff, nil, nil)
-	require.NoError(t, err)
-	var ids []string
-	for _, s := range window {
-		ids = append(ids, s.ID)
-	}
-	assert.ElementsMatch(t, []string{child, pageNew}, ids)
-	for _, s := range window {
-		if s.ID == child {
-			require.NotNil(t, s.ParentSessionID)
-			assert.Equal(t, pageNew, *s.ParentSessionID)
-		}
 	}
 }

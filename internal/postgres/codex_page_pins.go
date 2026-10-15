@@ -201,18 +201,16 @@ func carryLegacyPageExclusions(ctx context.Context, tx *sql.Tx, rollouts map[str
 	if err != nil {
 		return fmt.Errorf("finding Codex page exclusions: %w", err)
 	}
+	defer rows.Close()
 	var stale []string
 	for rows.Next() {
 		var id string
 		if err := rows.Scan(&id); err != nil {
-			rows.Close()
 			return fmt.Errorf("reading Codex page exclusions: %w", err)
 		}
 		stale = append(stale, id)
 	}
-	err = rows.Err()
-	rows.Close()
-	if err != nil {
+	if err := rows.Err(); err != nil {
 		return fmt.Errorf("reading Codex page exclusions: %w", err)
 	}
 	for _, oldID := range stale {
