@@ -1320,11 +1320,18 @@ func (db *DB) GetSessionName(
 
 // A pre-revert-page deletion covered the whole Codex thread. Keep that scope
 // even for page files absent during the upgrade. New deletions remain exact IDs.
+// A pathless exclusion recorded under a page's bare rollout id (before data
+// version 134, with no file name to rename it by) also covers the page's
+// <thread>_<rollout> id.
 const sessionExcludedQuery = `SELECT EXISTS (
 	SELECT 1 FROM excluded_sessions
 	WHERE id = ?1 OR (
 		include_codex_pages = 1 AND substr(?1, -37, 1) = '_'
 		AND id = substr(?1, 1, length(?1) - 37)
+	) OR (
+		(file_path IS NULL OR file_path = '') AND length(?1) > 74
+		AND substr(?1, -37, 1) = '_' AND substr(?1, -74, 1) = ':'
+		AND id = substr(?1, 1, length(?1) - 73) || substr(?1, -36)
 	)
 )`
 

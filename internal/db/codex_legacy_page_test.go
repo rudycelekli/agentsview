@@ -4,6 +4,8 @@ import (
 	"database/sql"
 	"fmt"
 	"path/filepath"
+	"slices"
+	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -19,7 +21,115 @@ const (
 	legacyRoll3   = "66666666-6666-4666-8666-666666666666"
 	legacyThread4 = "77777777-7777-4777-8777-777777777777"
 	legacyRoll4   = "88888888-8888-4888-8888-888888888888"
+	legacyThread5 = "99999999-9999-4999-8999-999999999999"
+	legacyRoll5   = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+	legacyThread6 = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"
+	legacyRoll6   = "cccccccc-cccc-4ccc-8ccc-cccccccccccc"
 )
+
+// legacyRenamedColumns is every [table, column] that holds a session id and
+// moves with a renamed page, other than sessions.id. legacyJournalColumns
+// are session id columns the rename deliberately leaves alone: the change
+// journals record ids that no longer exist, and sessions.source_session_id
+// is a provider-side id, not a session id.
+var (
+	legacyRenamedColumns = [][2]string{
+		{"artifact_export_queue", "session_id"},
+		{"artifact_imported_sessions", "imported_session_id"},
+		{"artifact_publications", "session_id"},
+		{"claude_subagent_sources", "session_id"},
+		{"conversation_messages", "session_id"},
+		{"conversation_session_changes", "session_id"},
+		{"excluded_sessions", "id"},
+		{"local_session_source_baselines", "session_id"},
+		{"messages", "session_id"},
+		{"parser_checkpoint_blobs", "session_id"},
+		{"parser_checkpoints", "session_id"},
+		{"pinned_messages", "session_id"},
+		{"project_identity_observations", "session_id"},
+		{"raw_archive_sessions", "session_id"},
+		{"recall_entries", "source_session_id"},
+		{"recall_evidence", "session_id"},
+		{"recall_extract_progress", "session_id"},
+		{"secret_findings", "session_id"},
+		{"session_external_parents", "parent_session_id"},
+		{"session_external_parents", "session_id"},
+		{"session_labels", "session_id"},
+		{"session_project_assignments", "session_id"},
+		{"session_project_identity_snapshots", "session_id"},
+		{"session_signal_state", "session_id"},
+		{"sessions", "parent_session_id"},
+		{"sessions", "parser_parent_session_id"},
+		{"starred_sessions", "session_id"},
+		{"subagent_parent_cleanup_queue", "session_id"},
+		{"subagent_parent_repair_queue", "session_id"},
+		{"tool_call_occurrence_agent_state", "session_id"},
+		{"tool_calls", "session_id"},
+		{"tool_calls", "subagent_session_id"},
+		{"tool_result_events", "session_id"},
+		{"tool_result_events", "subagent_session_id"},
+		{"usage_events", "session_id"},
+	}
+	legacyJournalColumns = [][2]string{
+		{"session_deletion_changes", "session_id"},
+		{"session_project_identity_snapshot_changes", "session_id"},
+		{"sessions", "source_session_id"},
+	}
+)
+
+// TestLegacyCodexPageRenameCoversSessionIDColumns finds every column that can
+// hold a session id straight from the schema, with its own broader pattern,
+// and requires the result to equal the lists above and the migration's walk
+// to equal the renamed list. A new table with a session id column fails here
+// until someone decides whether the rename must move it.
+func TestLegacyCodexPageRenameCoversSessionIDColumns(t *testing.T) {
+	ctx := t.Context()
+	path := filepath.Join(t.TempDir(), "test.db")
+	d, err := Open(ctx, path)
+	require.NoError(t, err)
+	d.Close()
+	conn, err := sql.Open("sqlite3", path)
+	require.NoError(t, err)
+	defer conn.Close()
+
+	rows, err := conn.QueryContext(ctx, `
+		SELECT m.name, p.name FROM sqlite_master m, pragma_table_info(m.name) p
+		WHERE m.type = 'table' AND m.name NOT LIKE 'sqlite_%'
+		  AND m.sql NOT LIKE 'CREATE VIRTUAL%'
+		  AND (p.name LIKE '%session%id%'
+		       OR (m.name = 'excluded_sessions' AND p.name = 'id'))
+		UNION
+		SELECT m.name, f."from" FROM sqlite_master m, pragma_foreign_key_list(m.name) f
+		WHERE m.type = 'table' AND f."table" = 'sessions'`)
+	require.NoError(t, err)
+	var found [][2]string
+	for rows.Next() {
+		var c [2]string
+		require.NoError(t, rows.Scan(&c[0], &c[1]))
+		found = append(found, c)
+	}
+	require.NoError(t, rows.Err())
+	rows.Close()
+	want := append(slices.Clone(legacyRenamedColumns), legacyJournalColumns...)
+	sortPairs := func(p [][2]string) {
+		slices.SortFunc(p, func(a, b [2]string) int {
+			return strings.Compare(a[0]+"."+a[1], b[0]+"."+b[1])
+		})
+	}
+	sortPairs(found)
+	sortPairs(want)
+	assert.Equal(t, want, found, "session id columns in the schema")
+
+	tx, err := conn.BeginTx(ctx, nil)
+	require.NoError(t, err)
+	defer tx.Rollback()
+	walked, err := sessionIDColumnsLocked(ctx, tx)
+	require.NoError(t, err)
+	renamed := slices.Clone(legacyRenamedColumns)
+	sortPairs(walked)
+	sortPairs(renamed)
+	assert.Equal(t, renamed, walked, "columns the migration renames")
+}
 
 func legacyPagePath(thread, rollout string) *string {
 	p := "/sessions/2026/09/01/rollout-2026-09-01T10-00-00-" + thread + "_" + rollout + ".jsonl"
@@ -50,6 +160,10 @@ func TestOpenRenamesLegacyCodexPages(t *testing.T) {
 				gone     = "codex:" + legacyRoll4
 				goneNew  = "codex:" + legacyThread4 + "_" + legacyRoll4
 				child    = "codex:child"
+				pathless = "codex:" + legacyRoll5
+				pathNew  = "codex:" + legacyThread5 + "_" + legacyRoll5
+				claimed  = "codex:" + legacyRoll6
+				claimNew = "codex:" + legacyThread6 + "_" + legacyRoll6
 			)
 			codexOpt := func(p *string, parent string) func(*Session) {
 				return func(s *Session) {
@@ -83,6 +197,15 @@ func TestOpenRenamesLegacyCodexPages(t *testing.T) {
 				`INSERT INTO excluded_sessions (id, file_path) VALUES (?, ?)`,
 				gone, *legacyPagePath(legacyThread4, legacyRoll4))
 			require.NoError(t, err)
+			// An exclusion from before file names were recorded has no path to
+			// rename it by; the page's new id must still read as excluded.
+			_, err = d.getWriter().Exec(ctx,
+				`INSERT INTO excluded_sessions (id, file_path) VALUES (?, NULL)`, pathless)
+			require.NoError(t, err)
+			// A child already points at claimNew, so renaming claimed into it
+			// could merge two identities. The page stays as it is.
+			insertSession(t, d, claimed, "proj", codexOpt(legacyPagePath(legacyThread6, legacyRoll6), ""))
+			insertSession(t, d, "codex:claimant", "proj", codexOpt(nil, claimNew))
 			before, err := d.GetSession(ctx, page)
 			require.NoError(t, err)
 			if archiveOnly {
@@ -136,6 +259,11 @@ func TestOpenRenamesLegacyCodexPages(t *testing.T) {
 
 			assert.True(t, d.IsSessionExcluded(ctx, goneNew))
 			assert.False(t, d.IsSessionExcluded(ctx, gone))
+			assert.True(t, d.IsSessionExcluded(ctx, pathNew), "a pathless exclusion still covers the page")
+			assert.False(t, d.IsSessionExcluded(ctx, "codex:"+legacyThread5+"_"+legacyRoll6))
+			kept, err := d.GetSession(ctx, claimed)
+			require.NoError(t, err)
+			assert.NotNil(t, kept, "a page whose target is referenced elsewhere is not renamed")
 
 			still, err := d.GetSession(ctx, taken)
 			require.NoError(t, err)
@@ -148,28 +276,14 @@ func TestOpenRenamesLegacyCodexPages(t *testing.T) {
 			).Scan(&journaled))
 			assert.Equal(t, 2, journaled, "old ids reach mirrors as deletions")
 
-			// Schema walk: no column of any table, however named, still holds
-			// an id that was renamed.
+			// No column that holds a session id still holds a renamed id. The
+			// column list is written out here rather than read from the
+			// migration, see TestLegacyCodexPageRenameCoversSessionIDColumns.
 			d.Close()
 			conn, err = sql.Open("sqlite3", path)
 			require.NoError(t, err)
 			defer conn.Close()
-			rows, err := conn.QueryContext(ctx, `
-				SELECT m.name, p.name FROM sqlite_master m, pragma_table_info(m.name) p
-				WHERE m.type = 'table' AND m.name NOT LIKE 'sqlite_%'
-				  AND m.sql NOT LIKE 'CREATE VIRTUAL%'
-				  AND m.name NOT IN ('session_deletion_changes',
-				      'session_project_identity_snapshot_changes')`)
-			require.NoError(t, err)
-			var cols [][2]string
-			for rows.Next() {
-				var c [2]string
-				require.NoError(t, rows.Scan(&c[0], &c[1]))
-				cols = append(cols, c)
-			}
-			require.NoError(t, rows.Err())
-			rows.Close()
-			for _, c := range cols {
+			for _, c := range append(slices.Clone(legacyRenamedColumns), [2]string{"sessions", "id"}) {
 				var n int
 				require.NoError(t, conn.QueryRowContext(ctx, fmt.Sprintf(
 					`SELECT COUNT(*) FROM %s WHERE CAST(%s AS TEXT) IN (?, ?, ?)`,

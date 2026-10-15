@@ -24,14 +24,16 @@ const codexLegacyPageVersion = 134
 // archives below codexLegacyPageVersion. Renaming in place, as the Devin source
 // uuid rewrite does, means curation, trash, exclusions, labels and
 // relationships need no translation later: every consumer sees one identity.
-// A page whose target id already exists is left for the reparse to settle.
+// A page whose target id is already in use anywhere is left for the reparse to
+// settle; a collision that slips through fails the open rather than replacing
+// a row.
 //
 // Every column that holds a session id is found from the schema: columns named
 // session_id or *_session_id, and every foreign key into sessions. Foreign
 // keys are deferred so parent and child rows can move in one transaction.
 //
-// The old id is journaled as a deletion, with the statements of
-// trg_sessions_deletion_journal_delete, and the new row's transcript revision
+// The old id is journaled as a deletion, as trg_sessions_deletion_journal_delete
+// would, and the new row's transcript revision
 // advances, so mirrors drop the old row and publish the new one.
 func renameLegacyCodexPagesLocked(ctx context.Context, w *writerHandle) error {
 	var version int
@@ -93,24 +95,28 @@ func renameLegacyCodexPagesLocked(ctx context.Context, w *writerHandle) error {
 	defer func() {
 		_, _ = tx.ExecContext(ctx, `DROP TABLE IF EXISTS temp._codex_page_renames`)
 	}()
+	cols, err := sessionIDColumnsLocked(ctx, tx)
+	if err != nil {
+		return err
+	}
 	for oldID, newID := range renames {
+		// A target id already present in any table that holds session ids
+		// could collide with a moved row. Leave such a page for the reparse.
+		taken, err := sessionIDInUseLocked(ctx, tx, cols, newID)
+		if err != nil {
+			return err
+		}
+		if taken {
+			continue
+		}
 		if _, err := tx.ExecContext(ctx, `INSERT INTO _codex_page_renames
-			SELECT ?1, ?2
-			WHERE NOT EXISTS (SELECT 1 FROM sessions WHERE id = ?2)
-			  AND NOT EXISTS (SELECT 1 FROM excluded_sessions WHERE id = ?2)`,
-			oldID, newID,
+			VALUES (?1, ?2)`, oldID, newID,
 		); err != nil {
 			return fmt.Errorf("recording legacy codex page rename: %w", err)
 		}
 	}
 
 	// Journal the old ids as deletions before the rows move.
-	if _, err := tx.ExecContext(ctx, `
-		INSERT INTO archive_metadata (key, value)
-			SELECT 'session_deletion_publication_revision', '0'
-		ON CONFLICT(key) DO NOTHING`); err != nil {
-		return fmt.Errorf("seeding deletion journal revision: %w", err)
-	}
 	var journaled []string
 	jrows, err := tx.QueryContext(ctx, `SELECT s.id, s.project FROM sessions s
 		JOIN _codex_page_renames r ON r.old_id = s.id`)
@@ -133,36 +139,18 @@ func renameLegacyCodexPagesLocked(ctx context.Context, w *writerHandle) error {
 		return fmt.Errorf("listing journaled legacy codex pages: %w", err)
 	}
 	for i, id := range journaled {
-		if _, err := tx.ExecContext(ctx, `
-			UPDATE archive_metadata SET
-				value = CAST(CAST(value AS INTEGER) + 1 AS TEXT),
-				updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
-			WHERE key = 'session_deletion_publication_revision'`); err != nil {
-			return fmt.Errorf("advancing deletion journal revision: %w", err)
-		}
-		if _, err := tx.ExecContext(ctx, `
-			INSERT INTO session_deletion_changes (session_id, project, revision, deleted)
-				SELECT ?1, ?2, CAST(value AS INTEGER), 1
-				FROM archive_metadata WHERE key = 'session_deletion_publication_revision'
-			ON CONFLICT(session_id) DO UPDATE SET
-				project = excluded.project, revision = excluded.revision, deleted = 1`,
-			id, projects[i],
-		); err != nil {
+		if err := journalSessionDeletionTx(ctx, tx, id, projects[i]); err != nil {
 			return fmt.Errorf("journaling legacy codex page: %w", err)
 		}
 	}
 
-	cols, err := sessionIDColumnsLocked(ctx, tx)
-	if err != nil {
-		return err
-	}
 	if _, err := tx.ExecContext(ctx, `UPDATE sessions
 		SET id = (SELECT new_id FROM _codex_page_renames WHERE old_id = sessions.id)
 		WHERE id IN (SELECT old_id FROM _codex_page_renames)`); err != nil {
 		return fmt.Errorf("renaming legacy codex pages: %w", err)
 	}
 	for _, c := range cols {
-		stmt := fmt.Sprintf(`UPDATE OR REPLACE %[1]s SET %[2]s = (
+		stmt := fmt.Sprintf(`UPDATE %[1]s SET %[2]s = (
 			SELECT new_id FROM _codex_page_renames WHERE old_id = %[1]s.%[2]s)
 			WHERE %[2]s IN (SELECT old_id FROM _codex_page_renames)`,
 			quoteIdent(c[0]), quoteIdent(c[1]))
@@ -205,8 +193,8 @@ func legacyCodexPageID(id, path string) (string, bool) {
 
 // sessionIDColumnsLocked lists [table, column] pairs, other than sessions.id,
 // that hold a session id: columns named session_id or *_session_id, and
-// foreign keys into sessions, plus excluded_sessions.id. The deletion journal is excluded because it
-// records ids that no longer exist.
+// foreign keys into sessions, plus excluded_sessions.id. The change journals
+// are excluded because they record ids that no longer exist.
 func sessionIDColumnsLocked(
 	ctx context.Context, tx *sql.Tx,
 ) ([][2]string, error) {
@@ -245,4 +233,25 @@ func sessionIDColumnsLocked(
 
 func quoteIdent(name string) string {
 	return `"` + strings.ReplaceAll(name, `"`, `""`) + `"`
+}
+
+// sessionIDInUseLocked reports whether id appears in sessions.id or any
+// listed session id column.
+func sessionIDInUseLocked(
+	ctx context.Context, tx *sql.Tx, cols [][2]string, id string,
+) (bool, error) {
+	for _, c := range append([][2]string{{"sessions", "id"}}, cols...) {
+		var used bool
+		err := tx.QueryRowContext(ctx, fmt.Sprintf(
+			`SELECT EXISTS (SELECT 1 FROM %s WHERE %s = ?)`,
+			quoteIdent(c[0]), quoteIdent(c[1])), id,
+		).Scan(&used)
+		if err != nil {
+			return false, fmt.Errorf("checking %s.%s for %s: %w", c[0], c[1], id, err)
+		}
+		if used {
+			return true, nil
+		}
+	}
+	return false, nil
 }

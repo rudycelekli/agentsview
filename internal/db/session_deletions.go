@@ -30,6 +30,32 @@ BEGIN
   project = excluded.project, revision = excluded.revision, deleted = 0;
 END;`
 
+// journalSessionDeletionTx records id as hard-deleted in the publication
+// journal, the same effect as trg_sessions_deletion_journal_delete, for a
+// change that removes an id without deleting its row.
+func journalSessionDeletionTx(
+	ctx context.Context, tx *sql.Tx, id, project string,
+) error {
+	if _, err := tx.ExecContext(ctx, `
+		INSERT INTO archive_metadata (key, value)
+			VALUES (?1, '1')
+		ON CONFLICT(key) DO UPDATE SET
+			value = CAST(CAST(value AS INTEGER) + 1 AS TEXT),
+			updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')`,
+		archiveMetadataSessionDeletionRevisionKey,
+	); err != nil {
+		return fmt.Errorf("advancing deletion journal revision: %w", err)
+	}
+	_, err := tx.ExecContext(ctx, `
+		INSERT INTO session_deletion_changes (session_id, project, revision, deleted)
+			SELECT ?1, ?2, CAST(value AS INTEGER), 1
+			FROM archive_metadata WHERE key = ?3
+		ON CONFLICT(session_id) DO UPDATE SET
+			project = excluded.project, revision = excluded.revision, deleted = 1`,
+		id, project, archiveMetadataSessionDeletionRevisionKey)
+	return err
+}
+
 // SessionDeletionPublicationRevision is an O(1) change token for hard
 // session deletions and repairs, advanced by triggers.
 func (db *DB) SessionDeletionPublicationRevision(ctx context.Context) (int64, error) {
