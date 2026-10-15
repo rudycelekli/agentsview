@@ -23,6 +23,15 @@ func TestScopedDataVersionProviders(t *testing.T) {
 	)
 }
 
+// Version 134 renames stored Codex pages before the reparse, so it upgrades
+// only the Codex-format providers.
+func TestCodexLegacyPageVersionIsScopedReparse(t *testing.T) {
+	assert.ElementsMatch(t,
+		[]parser.AgentType{parser.AgentCodex, parser.AgentTraeX, parser.AgentAugureCode},
+		ScopedDataVersionProviders(133, 134),
+	)
+}
+
 func TestValidateDataVersionScopes(t *testing.T) {
 	require.NoError(t, validateDataVersionScopes(dataVersionScopes),
 		"declared parser upgrades must stay within the scoped-upgrade rules")

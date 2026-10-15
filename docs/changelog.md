@@ -87,6 +87,9 @@ The latest release is
 
 **Bug fixes**
 
+- Codex revert pages written by older Codex versions now link to their thread
+  and take its title. Their stars, pins, labels, and trash state carry over when
+  the archive upgrades.
 - Hidden tabs release their live connections so new tabs load, and catch up when
   shown again.
 - DeepSeek Harness v4 sessions now appear after sync, with tool results and

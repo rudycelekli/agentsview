@@ -22,12 +22,20 @@ func (s *Sync) migrateCodexPages(
 	markerID string, legacyMarkerMachines []string,
 ) error {
 	threads := make(map[string]db.Session)
+	// Before data version 134 a page whose header named its own rollout was
+	// stored as codex:<rollout>. Map that old id to the page now stored as
+	// codex:<thread>_<rollout>.
+	rollouts := make(map[string]db.Session)
 	for _, sess := range batch {
 		switch sess.Agent {
 		case "codex", "traex", "augure-code":
 			prefixEnd := strings.LastIndex(sess.ID, ":") + 1
 			if prefixEnd > 0 {
-				id := sess.ID[:prefixEnd] + parser.CodexThreadIDFromSessionKey(sess.ID[prefixEnd:])
+				key := sess.ID[prefixEnd:]
+				id := sess.ID[:prefixEnd] + parser.CodexThreadIDFromSessionKey(key)
+				if id != sess.ID {
+					rollouts[sess.ID[:prefixEnd]+key[len(id)-prefixEnd+1:]] = sess
+				}
 				// A rebuilt trash anchor has no file and may still have an old
 				// data version, even after restore. Migrate before publishing its
 				// empty transcript when the retained page is in a later batch.
@@ -41,13 +49,16 @@ func (s *Sync) migrateCodexPages(
 	if len(threads) == 0 {
 		return nil
 	}
+	if err := carryLegacyPageExclusions(ctx, tx, rollouts); err != nil {
+		return err
+	}
 	// Purge inventories pages under the thread lock. Keep that same lock
 	// through publication, including after the thread's migration or retirement.
 	rows, err := tx.QueryContext(ctx, `
 		SELECT id, COALESCE(file_path, ''), agent, machine, owner_marker, source_archive_id, data_version
 		FROM sessions
 		WHERE id = ANY($1) AND provenance_kind = 'legacy'
-		ORDER BY id FOR UPDATE`, mapKeys(threads))
+		ORDER BY id FOR UPDATE`, append(mapKeys(threads), mapKeys(rollouts)...))
 	if err != nil {
 		return fmt.Errorf("finding legacy Codex pages: %w", err)
 	}
@@ -71,6 +82,23 @@ func (s *Sync) migrateCodexPages(
 		return err
 	}
 	for _, old := range pages {
+		if rolloutPage, rolloutShape := rollouts[old.id]; rolloutShape {
+			// Filename-only match: the stored page and the batch page share
+			// one <thread>_<rollout> filename key.
+			prefixEnd := strings.LastIndex(rolloutPage.ID, ":") + 1
+			key := parser.CodexSessionUUIDFromFilename(old.path[strings.LastIndexAny(old.path, `/\`)+1:])
+			if old.dataVersion >= 134 || key == "" || key != rolloutPage.ID[prefixEnd:] ||
+				!sameSessionOwner(
+					old.owner, old.machine, markerID,
+					db.MirroredSessionMachine(rolloutPage, s.machine), legacyMarkerMachines,
+				) {
+				continue
+			}
+			if err := s.renameLegacyRolloutPage(ctx, tx, old.id, old.agent, old.archive, rolloutPage.ID, markerID, legacyMarkerMachines); err != nil {
+				return err
+			}
+			continue
+		}
 		syncScope := s.isFiltered() && !slices.ContainsFunc(batch, func(sess db.Session) bool { return sess.ID == old.id })
 		migratePage := old.dataVersion < 131 && old.path != ""
 		if !syncScope && !migratePage {
@@ -165,6 +193,65 @@ func (s *Sync) migrateCodexPages(
 		}
 	}
 	return nil
+}
+
+// carryLegacyPageExclusions moves a remote exclusion recorded under an old
+// codex:<rollout> id to the page's current id, so a permanently deleted page
+// stays deleted after the rename.
+func carryLegacyPageExclusions(ctx context.Context, tx *sql.Tx, rollouts map[string]db.Session) error {
+	for oldID, page := range rollouts {
+		if _, err := tx.ExecContext(ctx, `
+			WITH moved AS (DELETE FROM excluded_sessions WHERE id = $1 RETURNING *)
+			INSERT INTO excluded_sessions (id, include_codex_pages, owner_marker, machine, agent, created_at)
+			SELECT $2, include_codex_pages, owner_marker, machine, agent, created_at FROM moved
+			ON CONFLICT (id) DO NOTHING`, oldID, page.ID); err != nil {
+			return fmt.Errorf("moving Codex page exclusion: %w", err)
+		}
+	}
+	return nil
+}
+
+// renameLegacyRolloutPage replaces a remote page row stored as
+// codex:<rollout> with the page at its current id, keeping its pins, star,
+// name, and trash state.
+func (s *Sync) renameLegacyRolloutPage(
+	ctx context.Context, tx *sql.Tx, oldID, agent, archive, pageID string,
+	markerID string, legacyMarkerMachines []string,
+) error {
+	if archive != "" && archive != s.archiveID {
+		return errors.New("cannot migrate Codex pages from another source archive")
+	}
+	page, err := s.local.GetArtifactExportSession(ctx, pageID)
+	if err != nil {
+		return fmt.Errorf("reading retained Codex page: %w", err)
+	}
+	if page == nil || page.Agent != agent {
+		return fmt.Errorf("cannot replace legacy Codex page: retained page %s is unavailable", pageID)
+	}
+	if projectFailsFilter(page.Project, s.projects, s.excludeProjects) {
+		return fmt.Errorf("preserving the Codex page requires including project %q in the push", page.Project)
+	}
+	pins, err := snapshotPinnedMessages(ctx, tx, oldID)
+	if err != nil {
+		return err
+	}
+	var pageExists bool
+	if err := tx.QueryRowContext(ctx, `SELECT EXISTS (SELECT 1 FROM sessions WHERE id = $1)`, pageID).Scan(&pageExists); err != nil {
+		return fmt.Errorf("checking retained Codex page: %w", err)
+	}
+	if err := s.pushSession(ctx, tx, *page, markerID, legacyMarkerMachines); err != nil {
+		return fmt.Errorf("publishing retained Codex page: %w", err)
+	}
+	if _, err := s.pushMessages(ctx, tx, pageID, true, nil, nil); err != nil {
+		return err
+	}
+	if _, err := s.pushSecretFindings(ctx, tx, pageID); err != nil {
+		return err
+	}
+	if err := restorePinnedMessages(ctx, tx, pageID, pins); err != nil {
+		return err
+	}
+	return retireCodexPageThread(ctx, tx, oldID, pageID, pageExists)
 }
 
 func retireCodexPageThread(ctx context.Context, tx *sql.Tx, threadID, pageID string, pageExists bool) error {

@@ -11,6 +11,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"go.kenn.io/agentsview/internal/db"
+	"go.kenn.io/agentsview/internal/dbtest"
 	"go.kenn.io/agentsview/internal/parser"
 	"go.kenn.io/agentsview/internal/testjsonl"
 )
@@ -762,4 +763,76 @@ func TestCodexRevertPageSpawnedSubagentLinksToThePage(t *testing.T) {
 	assert.Equal(t, paginationSessionID(1), *child.ParentSessionID,
 		"the spawn edge in the page outranks the thread id in the child's meta")
 	assert.Equal(t, "subagent", child.RelationshipType)
+}
+
+// A page written before data version 134 was stored as codex:<rollout> because
+// its header named its own rollout. After the upgrade renames it in place, the
+// scoped resync links it to its thread and gives it the thread's index title,
+// and the next sync finds nothing left to parse.
+func TestCodexLegacyHeaderPageUpgradeLinksAndTitlesThePage(t *testing.T) {
+	const rollout = "22222222-2222-4222-8222-222222222222"
+	home := t.TempDir()
+	root := filepath.Join(home, "sessions")
+	writeCodexUsagePage(t, root, 0, true, true)
+	pagePath := writeCodexRollout(t, root, "25", "rollout-2026-09-25T10-00-00-"+paginationThread+"_"+rollout+".jsonl",
+		testjsonl.JoinJSONL(
+			testjsonl.CodexSessionMetaWithFieldsJSON(rollout, "/work/project", "codex_cli_rs", "2026-09-25T10:00:00Z",
+				map[string]any{"session_id": paginationThread, "history_mode": "paginated",
+					"history_base": map[string]any{"thread_id": paginationThread}}),
+			codexUserEntryJSON("2026-09-25T10:00:01Z", "page prompt"),
+		))
+	indexPath := filepath.Join(home, parser.CodexSessionIndexFilename)
+	writeIndex := func(title string) {
+		t.Helper()
+		require.NoError(t, os.WriteFile(indexPath, fmt.Appendf(nil, `{"id":"%s","thread_name":"%s"}`+"\n", paginationThread, title), 0o644))
+		parser.EvictCodexSessionIndex(indexPath)
+	}
+	writeIndex("Original title")
+
+	dbPath := filepath.Join(t.TempDir(), "test.db")
+	database := dbtest.OpenTestDBAt(t, dbPath)
+	oldID, pageID := "codex:"+rollout, paginationSessionID(0)+"_"+rollout
+	require.NoError(t, database.UpsertSession(t.Context(), db.Session{
+		ID: oldID, Agent: "codex", Project: "project", Machine: "local",
+		FilePath: &pagePath, MessageCount: 1,
+	}))
+	require.NoError(t, database.InsertMessages(t.Context(), []db.Message{{
+		SessionID: oldID, Role: "user", Content: "page prompt", Timestamp: "2026-09-25T10:00:01Z",
+	}}))
+	require.NoError(t, database.Close())
+	raw, err := sql.Open("sqlite3", dbPath)
+	require.NoError(t, err)
+	_, err = raw.ExecContext(t.Context(), "PRAGMA user_version=133")
+	require.NoError(t, err)
+	require.NoError(t, raw.Close())
+	database, err = db.Open(t.Context(), dbPath)
+	require.NoError(t, err)
+	t.Cleanup(func() { database.Close() })
+
+	moved, err := database.GetSession(t.Context(), pageID)
+	require.NoError(t, err)
+	require.NotNil(t, moved, "the open renames the stored page")
+
+	engine := newCodexRevertEngine(t, database, root)
+	require.Zero(t, engine.SyncAll(t.Context(), nil).Failed)
+	page, err := database.GetSessionFull(t.Context(), pageID)
+	require.NoError(t, err)
+	require.NotNil(t, page)
+	require.NotNil(t, page.ParentSessionID)
+	assert.Equal(t, paginationSessionID(0), *page.ParentSessionID)
+	name, found, err := database.GetSessionName(t.Context(), pageID)
+	require.NoError(t, err)
+	require.True(t, found)
+	assert.Equal(t, "Original title", name)
+	gone, err := database.GetSession(t.Context(), oldID)
+	require.NoError(t, err)
+	assert.Nil(t, gone)
+
+	assert.Zero(t, engine.SyncAll(t.Context(), nil).Synced, "a second sync parses nothing")
+
+	writeIndex("Renamed title")
+	engine.SyncPaths([]string{indexPath})
+	name, _, err = database.GetSessionName(t.Context(), pageID)
+	require.NoError(t, err)
+	assert.Equal(t, "Renamed title", name)
 }

@@ -576,7 +576,11 @@ CREATE INDEX IF NOT EXISTS idx_provider_freshness_updated_at
 // (133: Codex-format sessions store git_branch from session_meta git.branch.
 // Re-parse unchanged Codex-format sources in place so existing sessions gain
 // the branch they started on.)
-const dataVersion = 133
+// (134: a Codex revert page written by Codex Desktop 0.148.0-alpha.15 through
+// 0.154.0-alpha.6.2 names its own rollout in session_meta.id. It is now stored
+// as codex:<thread>_<rollout>, linked to its thread. Stored pages are renamed
+// in place before the scoped reparse, so identities are preserved.)
+const dataVersion = 134
 
 const archiveOnlyVersionBase = 1 << 20
 
@@ -3116,6 +3120,9 @@ func (db *DB) migrateColumns(ctx context.Context, progress OpenProgressFunc) err
 		return err
 	}
 	if err := scopeLegacyDevinSourceUUIDsLocked(ctx, w); err != nil {
+		return err
+	}
+	if err := renameLegacyCodexPagesLocked(ctx, w); err != nil {
 		return err
 	}
 	if err := ensureConversationSchemaLocked(ctx, w); err != nil {

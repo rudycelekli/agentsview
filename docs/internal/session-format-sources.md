@@ -559,8 +559,11 @@ fixtures retain this field; missing identities remain source-local.
   ([revert_thread.rs](https://github.com/openai/codex/blob/6b9826e3aa83b1a5947db50f4332cb9c65f1b340/codex-rs/thread-store/src/local/revert_thread.rs#L160-L177)
   and
   [rollout_file_name.rs](https://github.com/openai/codex/blob/6b9826e3aa83b1a5947db50f4332cb9c65f1b340/codex-rs/rollout/src/rollout_file_name.rs#L62-L73)).
-  History length never creates one. Its `session_meta` keeps the thread id
-  in `id`, sets `history_mode: "paginated"`, and carries a `history_base`
+  History length never creates one. Its `session_meta` `id` is the thread
+  id in current writers; the observed older headers name the page's own
+  rollout instead, with `session_id` holding the thread (or, for a page a
+  subagent copied, its spawner), so the filename is the contract and the
+  parser accepts either filename segment as the header `id`. It sets `history_mode: "paginated"`, and carries a `history_base`
   whose `thread_id` names a rollout id
   ([protocol.rs](https://github.com/openai/codex/blob/6b9826e3aa83b1a5947db50f4332cb9c65f1b340/codex-rs/protocol/src/protocol.rs#L3018-L3032)).
   The base is absent when the revert goes back to before the first turn
@@ -693,6 +696,10 @@ fixtures retain this field; missing identities remain source-local.
   newest surviving page without an original thread row. Reverified these
   archive and activity paths on 2026-10-02. Other Codex versions may differ.
   Tests: `TestCodexRevertPageSessionsThroughAPI`,
+  `TestCodexLegacyHeaderRevertPageAttachesViaFilename`,
+  `TestOpenRenamesLegacyCodexPages`,
+  `TestCodexLegacyHeaderPageUpgradeLinksAndTitlesThePage`,
+  `TestLegacyRolloutPageMovesToThreadKeyInPostgres`,
   `TestCodexRevertPagesFormATree`, `TestCodexRevertPagesRetainDailyUsage`,
   `TestCodexRevertPageUpgradeReplacesStaleThreadRow`,
   `TestCopySessionMetadataFrom_CodexPagePins`,

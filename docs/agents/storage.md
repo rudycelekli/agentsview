@@ -186,6 +186,13 @@ If the original rollout moves outside a filtered push's project scope, the
 curation transfer and removal of the old thread row share a transaction. A
 failed transfer leaves the thread and its pins intact.
 
+### Codex legacy revert-page ids
+
+Before data version 134, a revert page whose header named its own rollout was
+stored as `codex:<rollout>`. Opening an older archive renames those rows, and
+everything attached to them, to `codex:<thread>_<rollout>` in place before the
+scoped reparse, and the PostgreSQL push does the same for remote rows.
+
 ### Codex incremental import state
 
 Four SQLite-only tables support local Codex imports: `parser_checkpoints` holds
