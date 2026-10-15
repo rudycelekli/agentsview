@@ -33,8 +33,11 @@ const codexLegacyPageVersion = 134
 // keys are deferred so parent and child rows can move in one transaction.
 //
 // The old id is journaled as a deletion, as trg_sessions_deletion_journal_delete
-// would, and the new row's transcript revision
-// advances, so mirrors drop the old row and publish the new one.
+// would, and the new row's transcript revision advances, so mirrors drop the
+// old row and publish the new one. Sessions that referenced a renamed page
+// advance local_modified_at so an incremental mirror re-sends them, and an
+// initialized conversation export gets tombstones for the old id and fresh
+// revisions for the moved messages.
 func renameLegacyCodexPagesLocked(ctx context.Context, w *writerHandle) error {
 	var version int
 	if err := w.QueryRowContext(
@@ -144,6 +147,20 @@ func renameLegacyCodexPagesLocked(ctx context.Context, w *writerHandle) error {
 		}
 	}
 
+	// Rows that merely reference a renamed page keep their own identity, but
+	// the value they mirror changes. Find them before the rewrite.
+	referrers := map[string]bool{}
+	for _, c := range cols {
+		owners, err := referencingSessionsLocked(ctx, tx, c[0], c[1])
+		if err != nil {
+			return err
+		}
+		for _, id := range owners {
+			if _, renamed := renames[id]; !renamed {
+				referrers[id] = true
+			}
+		}
+	}
 	if _, err := tx.ExecContext(ctx, `UPDATE sessions
 		SET id = (SELECT new_id FROM _codex_page_renames WHERE old_id = sessions.id)
 		WHERE id IN (SELECT old_id FROM _codex_page_renames)`); err != nil {
@@ -167,6 +184,30 @@ func renameLegacyCodexPagesLocked(ctx context.Context, w *writerHandle) error {
 		}
 		if err := bumpTranscriptRevision(tx, newID, true); err != nil {
 			return err
+		}
+	}
+	// Sessions that referenced a renamed page advance local_modified_at, which
+	// the sync_marker trigger turns into an incremental mirror candidate.
+	for id := range referrers {
+		if _, err := tx.ExecContext(ctx, `UPDATE sessions
+			SET local_modified_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
+			WHERE id = ?`, id); err != nil {
+			return fmt.Errorf("touching session referencing a renamed codex page: %w", err)
+		}
+	}
+	if active, err := conversationExportActiveTx(contextTransaction{ctx: ctx, tx: tx}); err != nil {
+		return err
+	} else if active {
+		for _, id := range journaled {
+			var newID string
+			if err := tx.QueryRowContext(ctx,
+				`SELECT new_id FROM _codex_page_renames WHERE old_id = ?`, id,
+			).Scan(&newID); err != nil {
+				return fmt.Errorf("reading renamed codex page: %w", err)
+			}
+			if err := republishConversationRenameTx(ctx, tx, id, newID); err != nil {
+				return err
+			}
 		}
 	}
 	if err := tx.Commit(); err != nil {
@@ -229,6 +270,121 @@ func sessionIDColumnsLocked(
 	}
 	// Exclusions are keyed by the session id itself.
 	return append(cols, [2]string{"excluded_sessions", "id"}), rows.Err()
+}
+
+// referencingSessionsLocked returns the sessions whose mirrored data holds a
+// renamed id in table.col: the row's own id for the sessions table, otherwise
+// the row's session_id. Columns that are themselves a session_id belong to the
+// renamed page, whose revision advances anyway.
+func referencingSessionsLocked(
+	ctx context.Context, tx *sql.Tx, table, col string,
+) ([]string, error) {
+	var owner string
+	switch {
+	case table == "sessions":
+		owner = "id"
+	case col == "session_id":
+		return nil, nil
+	default:
+		var has bool
+		if err := tx.QueryRowContext(ctx, `SELECT EXISTS (
+			SELECT 1 FROM pragma_table_info(?) WHERE name = 'session_id')`, table,
+		).Scan(&has); err != nil {
+			return nil, fmt.Errorf("probing %s owner column: %w", table, err)
+		}
+		if !has {
+			return nil, nil
+		}
+		owner = "session_id"
+	}
+	rows, err := tx.QueryContext(ctx, fmt.Sprintf(
+		`SELECT DISTINCT %[3]s FROM %[1]s WHERE %[2]s IN (SELECT old_id FROM _codex_page_renames)`,
+		quoteIdent(table), quoteIdent(col), quoteIdent(owner)))
+	if err != nil {
+		return nil, fmt.Errorf("finding sessions referencing %s.%s: %w", table, col, err)
+	}
+	defer rows.Close()
+	var ids []string
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			return nil, fmt.Errorf("scanning referencing session: %w", err)
+		}
+		ids = append(ids, id)
+	}
+	return ids, rows.Err()
+}
+
+// republishConversationRenameTx tells conversation export consumers that
+// oldID is gone and newID carries its messages. The rewrite of session_id
+// alone is not a publishable change, so a client holding a checkpoint would
+// see an empty delta. Tombstones for the old messages and a session-level
+// tombstone follow the shape conversation_session_delete emits; the moved
+// messages and session state take fresh revisions.
+func republishConversationRenameTx(
+	ctx context.Context, tx *sql.Tx, oldID, newID string,
+) error {
+	// The insert trigger gives each tombstone its own revision.
+	if _, err := tx.ExecContext(ctx, `INSERT INTO conversation_messages
+		(session_id, message_id, ordinal, role, timestamp, source_id, body, digest,
+		 text_bytes, gap, deleted, removed, revision)
+		SELECT ?1, message_id, ordinal, role, timestamp, source_id, NULL, '',
+		 0, gap, 1, 1, 0
+		FROM conversation_messages WHERE session_id = ?2 AND removed = 0`,
+		oldID, newID); err != nil {
+		return fmt.Errorf("tombstoning renamed conversation messages: %w", err)
+	}
+	next := func() (int64, error) {
+		var rev int64
+		err := tx.QueryRowContext(ctx, `INSERT INTO archive_metadata(key,value) VALUES(?,'1')
+			ON CONFLICT(key) DO UPDATE SET value=CAST(CAST(value AS INTEGER)+1 AS TEXT)
+			RETURNING CAST(value AS INTEGER)`, conversationRevisionKey).Scan(&rev)
+		return rev, err
+	}
+	rev, err := next()
+	if err != nil {
+		return err
+	}
+	if _, err := tx.ExecContext(ctx, `INSERT INTO conversation_session_changes
+		(session_id, revision, deleted) VALUES (?, ?, 1)
+		ON CONFLICT(session_id) DO UPDATE SET revision = excluded.revision, deleted = 1`,
+		oldID, rev); err != nil {
+		return fmt.Errorf("tombstoning renamed conversation session: %w", err)
+	}
+	rows, err := tx.QueryContext(ctx, `SELECT message_id FROM conversation_messages
+		WHERE session_id = ? AND removed = 0 ORDER BY ordinal`, newID)
+	if err != nil {
+		return fmt.Errorf("listing renamed conversation messages: %w", err)
+	}
+	var ids []string
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			rows.Close()
+			return err
+		}
+		ids = append(ids, id)
+	}
+	err = rows.Err()
+	rows.Close()
+	if err != nil {
+		return err
+	}
+	for _, id := range ids {
+		if rev, err = next(); err != nil {
+			return err
+		}
+		if _, err := tx.ExecContext(ctx, `UPDATE conversation_messages SET revision = ?
+			WHERE session_id = ? AND message_id = ?`, rev, newID, id); err != nil {
+			return fmt.Errorf("republishing renamed conversation message: %w", err)
+		}
+	}
+	if rev, err = next(); err != nil {
+		return err
+	}
+	_, err = tx.ExecContext(ctx, `UPDATE conversation_session_changes SET revision = ?
+		WHERE session_id = ?`, rev, newID)
+	return err
 }
 
 func quoteIdent(name string) string {
