@@ -3,6 +3,7 @@
 package postgres
 
 import (
+	"database/sql"
 	"path/filepath"
 	"testing"
 
@@ -63,8 +64,19 @@ func TestLegacyRolloutPageMovesToThreadKeyInPostgres(t *testing.T) {
 	_, err = syncer.pg.ExecContext(ctx, `INSERT INTO excluded_sessions (id) VALUES ($1)`, goneOld)
 	require.NoError(t, err)
 
-	renamed := testDB(t)
-	seed(renamed, pageID)
+	// Upgrade the original archive in place, as the next start would: the
+	// open renames the page, and the push marker and archive identity that
+	// published the old row stay with it.
+	legacyPath := legacy.Path()
+	require.NoError(t, legacy.Close())
+	raw, err := sql.Open("sqlite3", legacyPath)
+	require.NoError(t, err)
+	_, err = raw.ExecContext(ctx, "PRAGMA user_version = 133")
+	require.NoError(t, err)
+	require.NoError(t, raw.Close())
+	renamed, err := db.Open(ctx, legacyPath)
+	require.NoError(t, err)
+	t.Cleanup(func() { renamed.Close() })
 	require.NoError(t, renamed.SetSessionDataVersion(ctx, pageID, db.CurrentDataVersion()))
 	upgraded, err := New(pgURL, schema, renamed, "machine", true, storage.PusherOptions{})
 	require.NoError(t, err)

@@ -1322,7 +1322,8 @@ func (db *DB) GetSessionName(
 // even for page files absent during the upgrade. New deletions remain exact IDs.
 // A pathless exclusion recorded under a page's bare rollout id (before data
 // version 134, with no file name to rename it by) also covers the page's
-// <thread>_<rollout> id.
+// <thread>_<rollout> id. Other readers of excluded_sessions compare exact ids
+// of rows that already passed this check at ingestion, so they need no copy.
 const sessionExcludedQuery = `SELECT EXISTS (
 	SELECT 1 FROM excluded_sessions
 	WHERE id = ?1 OR (

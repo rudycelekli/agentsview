@@ -32,7 +32,9 @@ END;`
 
 // journalSessionDeletionTx records id as hard-deleted in the publication
 // journal, the same effect as trg_sessions_deletion_journal_delete, for a
-// change that removes an id without deleting its row.
+// change that removes an id without deleting its row. SQL triggers cannot call
+// Go, so the trigger body and this function repeat the same two statements;
+// keep them in step.
 func journalSessionDeletionTx(
 	ctx context.Context, tx *sql.Tx, id, project string,
 ) error {

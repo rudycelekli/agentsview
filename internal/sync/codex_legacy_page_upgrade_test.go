@@ -133,3 +133,92 @@ func TestCodexLegacyPageUpgradeRepublishesConversationExport(t *testing.T) {
 	require.NoError(t, err)
 	assert.Empty(t, again.Changes, "the delta is consumed once")
 }
+
+// A current-format page of the same thread already names the legacy page by
+// its canonical id as its parent, since the parser computes that id ahead of
+// any rename. That forward reference must not block the rename: the legacy
+// page keeps its star and pin and its content lands under the canonical id,
+// with no duplicate left behind by the scoped reparse.
+func TestCodexLegacyPageUpgradeSurvivesCanonicalParentReference(t *testing.T) {
+	ctx := t.Context()
+	const (
+		rollout1 = "22222222-2222-4222-8222-222222222222"
+		rollout2 = "33333333-3333-4333-8333-333333333333"
+	)
+	legacyID := "codex:" + rollout1
+	canonicalID := "codex:" + paginationThread + "_" + rollout1
+	secondID := "codex:" + paginationThread + "_" + rollout2
+	root := filepath.Join(t.TempDir(), "sessions")
+	legacyPath := writeCodexRollout(t, root, "25",
+		"rollout-2026-09-25T10-00-00-"+paginationThread+"_"+rollout1+".jsonl",
+		testjsonl.JoinJSONL(
+			testjsonl.CodexSessionMetaWithFieldsJSON(rollout1, "/work/project", "codex_cli_rs", "2026-09-25T10:00:00Z",
+				map[string]any{
+					"session_id": paginationThread, "history_mode": "paginated",
+					"history_base": map[string]any{"thread_id": paginationThread},
+				}),
+			codexUserEntryJSON("2026-09-25T10:00:01Z", "legacy prompt"),
+			codexAssistantEntryJSON("2026-09-25T10:00:02Z", "legacy answer"),
+		))
+	secondPath := writeCodexRollout(t, root, "26",
+		"rollout-2026-09-26T10-00-00-"+paginationThread+"_"+rollout2+".jsonl",
+		testjsonl.JoinJSONL(
+			codexRevertMeta("2026-09-26T10:00:00Z", rollout1, 2),
+			codexUserEntryJSON("2026-09-26T10:00:01Z", "second prompt"),
+			codexAssistantEntryJSON("2026-09-26T10:00:02Z", "second answer"),
+		))
+
+	dbPath := filepath.Join(t.TempDir(), "test.db")
+	database := dbtest.OpenTestDBAt(t, dbPath)
+	require.NoError(t, database.UpsertSession(ctx, db.Session{
+		ID: legacyID, Agent: "codex", Project: "project", Machine: "local",
+		FilePath: &legacyPath, MessageCount: 2,
+	}))
+	require.NoError(t, database.InsertMessages(ctx, []db.Message{
+		{SessionID: legacyID, Ordinal: 0, Role: "user", Content: "legacy prompt", Timestamp: "2026-09-25T10:00:01Z"},
+		{SessionID: legacyID, Ordinal: 1, Role: "assistant", Content: "legacy answer", Timestamp: "2026-09-25T10:00:02Z"},
+	}))
+	require.NoError(t, database.UpsertSession(ctx, db.Session{
+		ID: secondID, Agent: "codex", Project: "project", Machine: "local",
+		FilePath: &secondPath, MessageCount: 2, ParentSessionID: &canonicalID,
+	}))
+	require.NoError(t, database.InsertMessages(ctx, []db.Message{
+		{SessionID: secondID, Ordinal: 0, Role: "user", Content: "second prompt", Timestamp: "2026-09-26T10:00:01Z"},
+		{SessionID: secondID, Ordinal: 1, Role: "assistant", Content: "second answer", Timestamp: "2026-09-26T10:00:02Z"},
+	}))
+	msgs, err := database.GetAllMessages(ctx, legacyID)
+	require.NoError(t, err)
+	_, err = database.PinMessage(ctx, legacyID, msgs[0].ID, nil)
+	require.NoError(t, err)
+	_, err = database.StarSession(ctx, legacyID)
+	require.NoError(t, err)
+	require.NoError(t, database.Close())
+
+	raw, err := sql.Open("sqlite3", dbPath)
+	require.NoError(t, err)
+	_, err = raw.ExecContext(ctx, "PRAGMA user_version=133")
+	require.NoError(t, err)
+	require.NoError(t, raw.Close())
+	database, err = db.Open(ctx, dbPath)
+	require.NoError(t, err)
+	t.Cleanup(func() { database.Close() })
+
+	engine := newCodexRevertEngine(t, database, root)
+	require.Zero(t, engine.SyncAll(ctx, nil).Failed)
+
+	gone, err := database.GetSessionFull(ctx, legacyID)
+	require.NoError(t, err)
+	assert.Nil(t, gone, "no duplicate is left under the bare rollout id")
+	starred, err := database.ListStarredSessionIDs(ctx)
+	require.NoError(t, err)
+	assert.Equal(t, []string{canonicalID}, starred)
+	pins, err := database.ListPinnedMessages(ctx, canonicalID, "")
+	require.NoError(t, err)
+	assert.Len(t, pins, 1)
+	assert.Equal(t, []string{"legacy prompt", "legacy answer"}, messageContents(t, database, canonicalID))
+	second, err := database.GetSession(ctx, secondID)
+	require.NoError(t, err)
+	require.NotNil(t, second)
+	require.NotNil(t, second.ParentSessionID)
+	assert.Equal(t, canonicalID, *second.ParentSessionID)
+}

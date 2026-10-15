@@ -24,8 +24,8 @@ const codexLegacyPageVersion = 134
 // archives below codexLegacyPageVersion. Renaming in place, as the Devin source
 // uuid rewrite does, means curation, trash, exclusions, labels and
 // relationships need no translation later: every consumer sees one identity.
-// A page whose target id is already in use anywhere is skipped and left for
-// the reparse to settle, so the rename never replaces a row.
+// A page whose target id already names a session or an exclusion is skipped
+// and left for the reparse to settle, so the rename never replaces a row.
 //
 // Every column that holds a session id is found from the schema: columns named
 // session_id or *_session_id, and every foreign key into sessions. Foreign
@@ -86,9 +86,11 @@ func renameLegacyCodexPagesLocked(ctx context.Context, w *writerHandle) error {
 		return err
 	}
 	for oldID, newID := range renames {
-		// A target id already present in any table that holds session ids
-		// could collide with a moved row. Leave such a page for the reparse.
-		taken, err := sessionIDInUseLocked(ctx, tx, cols, newID)
+		// A target id that already names a session or an exclusion would
+		// collide with the moved row. Leave such a page for the reparse.
+		// Rows that merely reference the target, such as a later page's
+		// parent_session_id, are rewritten with the rest and do not block.
+		taken, err := sessionIDInUseLocked(ctx, tx, newID)
 		if err != nil {
 			return err
 		}
@@ -140,6 +142,11 @@ func renameLegacyCodexPagesLocked(ctx context.Context, w *writerHandle) error {
 		return fmt.Errorf("renaming legacy codex pages: %w", err)
 	}
 	for _, c := range cols {
+		// The manifest hash in a publication row embeds the old id. The
+		// export queue below replaces the row instead of renaming it.
+		if c[0] == "artifact_publications" {
+			continue
+		}
 		stmt := fmt.Sprintf(`UPDATE %[1]s SET %[2]s = (
 			SELECT new_id FROM _codex_page_renames WHERE old_id = %[1]s.%[2]s)
 			WHERE %[2]s IN (SELECT old_id FROM _codex_page_renames)`,
@@ -147,6 +154,9 @@ func renameLegacyCodexPagesLocked(ctx context.Context, w *writerHandle) error {
 		if _, err := tx.ExecContext(ctx, stmt); err != nil {
 			return fmt.Errorf("renaming %s.%s: %w", c[0], c[1], err)
 		}
+	}
+	if err := requeueArtifactExportsTx(ctx, tx, pages); err != nil {
+		return err
 	}
 	active, err := conversationExportActiveTx(contextTransaction{ctx: ctx, tx: tx})
 	if err != nil {
@@ -305,20 +315,16 @@ func republishConversationRenameTx(
 			RETURNING CAST(value AS INTEGER)`, conversationRevisionKey).Scan(&rev)
 		return rev, err
 	}
-	rev, err := next()
-	if err != nil {
-		return err
-	}
-	if _, err := tx.ExecContext(ctx, `INSERT INTO conversation_session_changes
-		(session_id, revision, deleted) VALUES (?, ?, 1)
-		ON CONFLICT(session_id) DO UPDATE SET revision = excluded.revision, deleted = 1`,
-		oldID, rev); err != nil {
+	if err := putConversationSessionChangeTx(
+		contextTransaction{ctx: ctx, tx: tx}, oldID, "", true,
+	); err != nil {
 		return fmt.Errorf("tombstoning renamed conversation session: %w", err)
 	}
 	ids, err := liveConversationMessageIDs(ctx, tx, newID)
 	if err != nil {
 		return err
 	}
+	var rev int64
 	for _, id := range ids {
 		if rev, err = next(); err != nil {
 			return err
@@ -360,23 +366,42 @@ func quoteIdent(name string) string {
 	return `"` + strings.ReplaceAll(name, `"`, `""`) + `"`
 }
 
-// sessionIDInUseLocked reports whether id appears in sessions.id or any
-// listed session id column.
-func sessionIDInUseLocked(
-	ctx context.Context, tx *sql.Tx, cols [][2]string, id string,
-) (bool, error) {
-	for _, c := range append([][2]string{{"sessions", "id"}}, cols...) {
-		var used bool
-		err := tx.QueryRowContext(ctx, fmt.Sprintf(
-			`SELECT EXISTS (SELECT 1 FROM %s WHERE %s = ?)`,
-			quoteIdent(c[0]), quoteIdent(c[1])), id,
-		).Scan(&used)
-		if err != nil {
-			return false, fmt.Errorf("checking %s.%s for %s: %w", c[0], c[1], id, err)
+// requeueArtifactExportsTx replaces published artifacts of renamed pages.
+// A publication's manifest embeds the session id and its hash covers the
+// manifest, so rewriting session_id in place would pair the new id with the
+// old content hash. Queueing the old id lets the exporter, which finds no
+// such session, delete that publication; queueing the new id publishes it.
+func requeueArtifactExportsTx(
+	ctx context.Context, tx *sql.Tx, pages []journaledLegacyPage,
+) error {
+	q := contextTransaction{ctx: ctx, tx: tx}
+	for _, p := range pages {
+		if _, err := tx.ExecContext(ctx, `INSERT INTO artifact_export_queue(session_id)
+			SELECT ?1 WHERE EXISTS (
+				SELECT 1 FROM artifact_publications WHERE session_id = ?1)
+			ON CONFLICT(session_id) DO UPDATE SET
+				generation = generation + 1, pending = 1,
+				rejected_generation = NULL, last_error = '', rejected_at = NULL`,
+			p.id); err != nil {
+			return fmt.Errorf("queueing stale artifact for %s: %w", p.id, err)
 		}
-		if used {
-			return true, nil
+		if err := enqueueArtifactExportTx(q, p.newID); err != nil {
+			return err
 		}
 	}
-	return false, nil
+	return nil
+}
+
+// sessionIDInUseLocked reports whether id is already a session or an
+// exclusion, the two tables where a rename would collide on the key.
+func sessionIDInUseLocked(
+	ctx context.Context, tx *sql.Tx, id string,
+) (bool, error) {
+	var used bool
+	err := tx.QueryRowContext(ctx, `SELECT EXISTS (SELECT 1 FROM sessions WHERE id = ?1)
+		OR EXISTS (SELECT 1 FROM excluded_sessions WHERE id = ?1)`, id).Scan(&used)
+	if err != nil {
+		return false, fmt.Errorf("checking whether %s is in use: %w", id, err)
+	}
+	return used, nil
 }

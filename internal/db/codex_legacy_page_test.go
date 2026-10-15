@@ -195,6 +195,10 @@ func TestOpenRenamesLegacyCodexPages(t *testing.T) {
 			require.NoError(t, err)
 			_, err = d.StarSession(ctx, page)
 			require.NoError(t, err)
+			_, err = d.getWriter().Exec(ctx, `INSERT INTO artifact_publications
+				(origin, session_id, manifest_hash, source_fingerprint)
+				VALUES ('o', ?, 'h', 'h')`, page)
+			require.NoError(t, err)
 			_, err = d.SetSessionLabels(ctx, page, []string{"keep"})
 			require.NoError(t, err)
 			require.NoError(t, d.SoftDeleteSession(ctx, hosted))
@@ -209,8 +213,8 @@ func TestOpenRenamesLegacyCodexPages(t *testing.T) {
 			_, err = d.getWriter().Exec(ctx,
 				`INSERT INTO excluded_sessions (id, file_path) VALUES (?, NULL)`, pathless)
 			require.NoError(t, err)
-			// A child already points at claimNew, so renaming claimed into it
-			// could merge two identities. The page stays as it is.
+			// A later page already names claimNew as its parent. That reference
+			// does not block the rename; it follows claimed to its new id.
 			insertSession(t, d, claimed, "proj", codexOpt(legacyPagePath(legacyThread6, legacyRoll6), ""))
 			insertSession(t, d, "codex:claimant", "proj", codexOpt(nil, claimNew))
 			before, err := d.GetSession(ctx, page)
@@ -268,9 +272,16 @@ func TestOpenRenamesLegacyCodexPages(t *testing.T) {
 			assert.False(t, d.IsSessionExcluded(ctx, gone))
 			assert.True(t, d.IsSessionExcluded(ctx, pathNew), "a pathless exclusion still covers the page")
 			assert.False(t, d.IsSessionExcluded(ctx, "codex:"+legacyThread5+"_"+legacyRoll6))
-			kept, err := d.GetSession(ctx, claimed)
+			oldClaimed, err := d.GetSession(ctx, claimed)
 			require.NoError(t, err)
-			assert.NotNil(t, kept, "a page whose target is referenced elsewhere is not renamed")
+			assert.Nil(t, oldClaimed, "a page whose target is only referenced is renamed")
+			newClaimed, err := d.GetSession(ctx, claimNew)
+			require.NoError(t, err)
+			assert.NotNil(t, newClaimed)
+			claimant, err := d.GetSession(ctx, "codex:claimant")
+			require.NoError(t, err)
+			require.NotNil(t, claimant.ParentSessionID)
+			assert.Equal(t, claimNew, *claimant.ParentSessionID)
 
 			still, err := d.GetSession(ctx, taken)
 			require.NoError(t, err)
@@ -283,14 +294,39 @@ func TestOpenRenamesLegacyCodexPages(t *testing.T) {
 			).Scan(&journaled))
 			assert.Equal(t, 2, journaled, "old ids reach mirrors as deletions")
 
-			// No column that holds a session id still holds a renamed id. The
-			// column list is written out here rather than read from the
-			// migration, see TestLegacyCodexPageRenameCoversSessionIDColumns.
+			// No session id column in the schema, found without the migration's
+			// help, still holds a renamed id. Journals keep ids that no longer
+			// exist, and a publication row keeps the old id until the exporter
+			// deletes it (the queue row asks for that), so its hash never pairs with the new id.
 			d.Close()
 			conn, err = sql.Open("sqlite3", path)
 			require.NoError(t, err)
 			defer conn.Close()
-			for _, c := range append(slices.Clone(legacyRenamedColumns), [2]string{"sessions", "id"}) {
+			rows, err := conn.QueryContext(ctx, `
+				SELECT m.name, p.name FROM sqlite_master m, pragma_table_info(m.name) p
+				WHERE m.type = 'table' AND m.name NOT LIKE 'sqlite_%'
+				  AND m.sql NOT LIKE 'CREATE VIRTUAL%'
+				  AND (p.name LIKE '%session%id%'
+				       OR (m.name IN ('sessions', 'excluded_sessions') AND p.name = 'id'))
+				UNION
+				SELECT m.name, f."from" FROM sqlite_master m, pragma_foreign_key_list(m.name) f
+				WHERE m.type = 'table' AND f."table" = 'sessions'`)
+			require.NoError(t, err)
+			var schemaCols [][2]string
+			for rows.Next() {
+				var c [2]string
+				require.NoError(t, rows.Scan(&c[0], &c[1]))
+				schemaCols = append(schemaCols, c)
+			}
+			require.NoError(t, rows.Err())
+			require.NoError(t, rows.Close())
+			require.NotEmpty(t, schemaCols)
+			for _, c := range schemaCols {
+				if slices.Contains(legacyJournalColumns, c) ||
+					c == [2]string{"artifact_publications", "session_id"} ||
+					c == [2]string{"artifact_export_queue", "session_id"} {
+					continue
+				}
 				var n int
 				require.NoError(t, conn.QueryRowContext(ctx, fmt.Sprintf(
 					`SELECT COUNT(*) FROM %s WHERE CAST(%s AS TEXT) IN (?, ?, ?)`,
@@ -298,6 +334,15 @@ func TestOpenRenamesLegacyCodexPages(t *testing.T) {
 				).Scan(&n))
 				assert.Zero(t, n, "%s.%s still holds a legacy page id", c[0], c[1])
 			}
+			var stale, pending int
+			require.NoError(t, conn.QueryRowContext(ctx,
+				`SELECT COUNT(*) FROM artifact_publications WHERE session_id = ?`, pageNew,
+			).Scan(&stale))
+			assert.Zero(t, stale, "the old manifest hash is not paired with the new id")
+			require.NoError(t, conn.QueryRowContext(ctx,
+				`SELECT COUNT(*) FROM artifact_export_queue WHERE session_id = ? AND pending = 1`, page,
+			).Scan(&pending))
+			assert.Equal(t, 1, pending, "the stale publication is queued for deletion")
 		})
 	}
 }
