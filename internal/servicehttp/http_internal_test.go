@@ -14,6 +14,22 @@ import (
 	"go.kenn.io/agentsview/internal/service"
 )
 
+func TestWatchFiltersSessionReady(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		assert.Equal(t, "/api/v1/sessions/session-a/watch", r.URL.Path)
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = fmt.Fprint(w, "event: session_ready\ndata: session-a\n\nevent: session_updated\ndata: session-a\n\nevent: heartbeat\ndata: tick\n\n")
+	}))
+	t.Cleanup(srv.Close)
+	events, err := NewHTTPBackend(srv.URL, "", false, "").Watch(t.Context(), "session-a")
+	require.NoError(t, err)
+	var got []service.Event
+	for event := range events {
+		got = append(got, event)
+	}
+	assert.Equal(t, []service.Event{{Event: "session_updated", Data: "session-a"}, {Event: "heartbeat", Data: "tick"}}, got)
+}
+
 func TestNewHTTPBackendUsesLongRunningClient(t *testing.T) {
 	t.Parallel()
 	svc := NewHTTPBackend("http://example.test", "", false, "")
