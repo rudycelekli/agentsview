@@ -1,5 +1,5 @@
 ---
-last_edited: 2026-10-07
+last_edited: 2026-10-14
 ---
 
 # Session Format Source Inventory
@@ -560,11 +560,17 @@ fixtures retain this field; missing identities remain source-local.
   and
   [rollout_file_name.rs](https://github.com/openai/codex/blob/6b9826e3aa83b1a5947db50f4332cb9c65f1b340/codex-rs/rollout/src/rollout_file_name.rs#L62-L73)).
   History length never creates one. Its `session_meta` `id` is the thread
-  id in current writers; the observed older headers name the page's own
-  rollout instead, with `session_id` holding the thread (or, for a page a
-  subagent copied, its spawner), so the filename is the contract and the
-  parser accepts either filename segment as the header `id`. It sets `history_mode: "paginated"`, and carries a `history_base`
-  whose `thread_id` names a rollout id
+  id in current writers. The older header shape is `no-public-source`: the
+  open-source writer records the thread id at every revision checked, so
+  the shape comes from local observation of Codex Desktop builds
+  (`0.148.0-alpha.15` through `0.154.0-alpha.6.2`), where `id` names the
+  page's own rollout and `session_id` holds the thread (or, for a page a
+  subagent copied, its spawner). The filename is therefore the contract,
+  and the parser accepts either filename segment as the header `id`. The
+  sanitized fixtures are the legacy-header cases in
+  `internal/parser/codex_revert_page_test.go`. A page sets
+  `history_mode: "paginated"`
+  and carries a `history_base` whose `thread_id` names a rollout id
   ([protocol.rs](https://github.com/openai/codex/blob/6b9826e3aa83b1a5947db50f4332cb9c65f1b340/codex-rs/protocol/src/protocol.rs#L3018-L3032)).
   The base is absent when the revert goes back to before the first turn
   ([paginated_fork.rs](https://github.com/openai/codex/blob/6b9826e3aa83b1a5947db50f4332cb9c65f1b340/codex-rs/thread-store/src/local/paginated_fork.rs#L136-L177)).
@@ -698,6 +704,7 @@ fixtures retain this field; missing identities remain source-local.
   Tests: `TestCodexRevertPageSessionsThroughAPI`,
   `TestCodexLegacyHeaderRevertPageAttachesViaFilename`,
   `TestOpenRenamesLegacyCodexPages`,
+  `TestLegacyCodexPageRenameCoversSessionIDColumns`,
   `TestCodexLegacyHeaderPageUpgradeLinksAndTitlesThePage`,
   `TestLegacyRolloutPageMovesToThreadKeyInPostgres`,
   `TestCodexRevertPagesFormATree`, `TestCodexRevertPagesRetainDailyUsage`,
